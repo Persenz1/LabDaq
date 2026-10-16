@@ -1,0 +1,123 @@
+{
+  "schema": "labdaq-profile-v1",
+  "channels": [
+    {
+      "index": 0,
+      "name": "10 Hz 正弦",
+      "unit": "V",
+      "sensitivity_mv_per_unit": 1000,
+      "zero_volts": 0.0,
+      "inverted": false
+    },
+    {
+      "index": 1,
+      "name": "90度相移",
+      "unit": "V",
+      "sensitivity_mv_per_unit": 1000,
+      "zero_volts": 0.0,
+      "inverted": false
+    },
+    {
+      "index": 2,
+      "name": "脉冲与噪声",
+      "unit": "V",
+      "sensitivity_mv_per_unit": 1000,
+      "zero_volts": 0.0,
+      "inverted": false
+    },
+    {
+      "index": 3,
+      "name": "5–100 Hz 扫频",
+      "unit": "V",
+      "sensitivity_mv_per_unit": 1000,
+      "zero_volts": 0.0,
+      "inverted": false
+    }
+  ],
+  "active_channels": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "ranges": [
+    10,
+    10,
+    10,
+    10
+  ],
+  "coupling": [
+    "DC",
+    "DC",
+    "DC",
+    "DC"
+  ],
+  "iepe": [
+    false,
+    false,
+    false,
+    false
+  ],
+  "sample_rate": 2000,
+  "scenario": "custom",
+  "experiment": "电信号模拟",
+  "signal_settings": {
+    "channels": [
+      {
+        "waveform": "sine",
+        "amplitude_v": 1,
+        "offset_v": 0.0,
+        "frequency_hz": 10,
+        "phase_deg": 0.0,
+        "noise_rms_v": 0.0,
+        "drift_v_per_s": 0.0,
+        "duty_cycle": 0.5,
+        "start_s": 0.0,
+        "duration_s": 1.0,
+        "end_frequency_hz": 100.0
+      },
+      {
+        "waveform": "sine",
+        "amplitude_v": 0.5,
+        "offset_v": 0.0,
+        "frequency_hz": 10,
+        "phase_deg": 90,
+        "noise_rms_v": 0.0,
+        "drift_v_per_s": 0.0,
+        "duty_cycle": 0.5,
+        "start_s": 0.0,
+        "duration_s": 1.0,
+        "end_frequency_hz": 100.0
+      },
+      {
+        "waveform": "pulse",
+        "amplitude_v": 2,
+        "offset_v": 0.0,
+        "frequency_hz": 10.0,
+        "phase_deg": 0.0,
+        "noise_rms_v": 0.01,
+        "drift_v_per_s": 0.0,
+        "duty_cycle": 0.5,
+        "start_s": 1,
+        "duration_s": 0.2,
+        "end_frequency_hz": 100.0
+      },
+      {
+        "waveform": "chirp",
+        "amplitude_v": 0.8,
+        "offset_v": 0.0,
+        "frequency_hz": 5,
+        "phase_deg": 0.0,
+        "noise_rms_v": 0.005,
+        "drift_v_per_s": 0.0,
+        "duty_cycle": 0.5,
+        "start_s": 0.0,
+        "duration_s": 8,
+        "end_frequency_hz": 100
+      }
+    ],
+    "seed": 2026
+  },
+  "input_hpf": null,
+  "hpf_loop": false
+}

@@ -1,0 +1,29 @@
+# All reference resources remain local: vendor packages, firmware, manuals,
+# downloaded source archives, sample data and hardware photographs.
+/resources/
+
+# Local extraction / reading intermediates.
+/.work/
+/.runtime/
+/core/target/
+
+# Local Codex/Gemini discussion; never publish to GitHub.
+/.local-collab/
+
+# Local project handoffs and laboratory-specific settings/data notes.
+/docs/开发文档/LabDAQ_需求与架构讨论交接_2026-10-13.md
+/docs/开发文档/LabDAQ_已确认需求与实验安排_2026-10-16.md
+/docs/功能实现/signal-input.md
+
+# User-created measurements and configurations. Only the synthetic example
+# configuration is part of the source distribution.
+/recordings/
+/configs/*
+!/configs/电信号模拟.json
+
+# Python caches and build outputs.
+__pycache__/
+.pytest_cache/
+*.egg-info/
+/build/
+/dist/
