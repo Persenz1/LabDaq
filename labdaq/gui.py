@@ -6,7 +6,6 @@ from datetime import datetime, timezone
 import argparse
 import json
 import math
-import os
 from pathlib import Path
 import shutil
 import sys
@@ -15,13 +14,17 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets as W
 
+from . import theme
+from .ui_kit import (CollapsibleSection, MetricCard, card, chip_button, divider,
+                     field, field_label, label, legend_chip, section_title,
+                     status_chip, status_dot)
 from .engine import AcquisitionEngine
 from .core_client import DEFAULT_ENDPOINT, RemoteEngine
 from .inputs import HpfReplaySession
 from .signals import SimulationSettings
 from .input_dialog import SignalDialog
 from .processing import ChannelSettings, convert_volts, spectrum, frequency_response, filter_window
-from .protocol import AcquisitionConfig
+from .protocol import AcquisitionConfig, plan_clock
 from .recording import load_session, next_recording_path
 from .data_dialog import ExportDialog, StatisticsDialog
 from .recording_library import RecordingLibraryDialog
@@ -29,57 +32,14 @@ from .plot_measurements import PlotMeasurements
 from .transport import enumerate_usb_devices
 
 ROOT = Path(__file__).resolve().parents[1]
-COLORS = ["#2878F0", "#0C9A83", "#ED9645", "#9460DA"]
-
-STYLE = """
-QWidget { font-family: 'Microsoft YaHei UI'; font-size: 13px; color: #26354D; }
-QMainWindow, QWidget#workspace { background: #F3F6FA; }
-QFrame#sidebar { background: #15263D; border: none; }
-QFrame#sidebar QLabel { color: #CAD5E5; background: transparent; }
-QFrame#sidebar QLabel#brand { color: white; font-size: 24px; font-weight: 700; }
-QFrame#sidebar QLabel#sideCaption { color: #8C9EB7; font-size: 11px; }
-QListWidget#nav { background: transparent; border: none; color: #C3CFE0; outline: none; }
-QListWidget#nav::item { padding: 15px 16px; margin: 4px 0; border-radius: 8px; }
-QListWidget#nav::item:selected { background: #29445F; color: #FFFFFF; border-left: 3px solid #5BD9C3; }
-QListWidget#nav::item:hover { background: #20364E; }
-QFrame#card { background: white; border: 1px solid #E0E7EF; border-radius: 10px; }
-QLabel#pageTitle { font-size: 24px; font-weight: 700; color: #172A43; }
-QLabel#sectionTitle { font-size: 15px; font-weight: 700; }
-QLabel#muted { color: #75849A; font-size: 12px; }
-QLabel#metric { font-size: 31px; font-weight: 650; }
-QLabel#badge { background: #FFF1D5; border: 1px solid #F3D6A0; border-radius: 6px; color: #966216; padding: 7px 12px; }
-QLabel#notice { background: #EAF0F7; color: #45607E; border-radius: 6px; padding: 9px 12px; }
-QPushButton { background: white; border: 1px solid #D5DEE9; border-radius: 6px; padding: 8px 13px; font-weight: 500; }
-QPushButton:hover { background: #EDF4FF; border-color: #96B9EE; }
-QPushButton:pressed { background: #DCEBFF; }
-QPushButton:disabled { background: #F3F5F8; color: #A1ACBB; border-color: #E2E7ED; }
-QPushButton#primary { background: #276FE3; color: white; border-color: #276FE3; }
-QPushButton#primary:hover { background: #185DCF; }
-QPushButton#primary:disabled { background: #BCCEEB; border-color: #BCCEEB; }
-QPushButton#record { color: #C94C56; border-color: #E8BBC0; }
-QPushButton#record:checked { background: #C94C56; color: white; }
-QPushButton:checked { background: #E3EDFB; }
-QComboBox, QDoubleSpinBox, QSpinBox, QLineEdit { background: white; border: 1px solid #D5DEE9; border-radius: 5px; padding: 7px; min-height: 19px; }
-QComboBox:disabled, QDoubleSpinBox:disabled, QSpinBox:disabled { background: #F1F4F8; color: #97A3B3; }
-QComboBox::drop-down { border: none; width: 24px; }
-QTableWidget { background: white; border: 1px solid #E1E7EF; gridline-color: #EEF1F6; selection-background-color: #E8F0FD; }
-QHeaderView::section { background: #F4F7FB; color: #61738C; border: none; border-bottom: 1px solid #DEE6EF; padding: 9px; }
-QPlainTextEdit { background: #F6F8FB; border: 1px solid #DFE6EF; border-radius: 6px; padding: 8px; font-family: Consolas, 'Microsoft YaHei UI'; font-size: 12px; }
-QTabWidget::pane { border: 1px solid #DFE6EF; background: white; }
-QTabBar::tab { padding: 10px 18px; background: #EDF2F8; }
-QTabBar::tab:selected { background: white; color: #276FE3; }
-QSlider::groove:horizontal { height: 5px; background: #D9E3F0; border-radius: 2px; }
-QSlider::handle:horizontal { width: 16px; margin: -6px 0; border-radius: 8px; background: #276FE3; }
-QCheckBox { spacing: 7px; }
-QToolTip { background: #172A43; color: white; border: none; padding: 5px; }
-"""
-
-
-def label(text: str, name: str = "", wrap: bool = False) -> W.QLabel:
-    result = W.QLabel(text)
-    result.setObjectName(name)
-    result.setWordWrap(wrap)
-    return result
+NAV_TITLES = ["实时采集", "信号分析", "数据回看", "设备与协议"]
+NAV_ICONS = ["wave", "stats", "history", "chip"]
+PAGE_SUBTITLES = [
+    "连接设备，配置采集参数，实时查看多通道信号波形与数值。",
+    "从时间波形到频域，明确每一次分析的来源与单位。",
+    "保留原始信号，让数据可以重新查看、分析和导出。",
+    "查看设备描述符、协议命令和离线冷启动流程。",
+]
 
 
 def button(text: str, callback=None, name="") -> W.QPushButton:
@@ -91,18 +51,10 @@ def button(text: str, callback=None, name="") -> W.QPushButton:
     return result
 
 
-def card() -> tuple[W.QFrame, W.QVBoxLayout]:
-    frame = W.QFrame()
-    frame.setObjectName("card")
-    layout = W.QVBoxLayout(frame)
-    layout.setContentsMargins(18, 16, 18, 16)
-    layout.setSpacing(12)
-    return frame, layout
-
-
 def plot_widget(ylabel="力", unit="N") -> pg.PlotWidget:
-    plot = pg.PlotWidget(background="w")
-    plot.showGrid(x=True, y=True, alpha=0.12)
+    p = theme.current()
+    plot = pg.PlotWidget(background=p.plot_bg)
+    plot.showGrid(x=True, y=True, alpha=0.10)
     plot.setLabel("bottom", "时间", units="s")
     plot.setLabel("left", ylabel, units=unit)
     # Prefixing a compound unit such as V²/Hz would visually turn milli(V²)
@@ -110,41 +62,61 @@ def plot_widget(ylabel="力", unit="N") -> pg.PlotWidget:
     plot.getAxis("left").enableAutoSIPrefix(False)
     plot.setMenuEnabled(False)
     plot.hideButtons()
-    for axis in ("left", "bottom"):
-        plot.getAxis(axis).setPen("#C9D3E1")
-        plot.getAxis(axis).setTextPen("#6C7E96")
+    theme.style_plot(plot, p)
     return plot
 
 
 def configure_application(app):
-    # Qt's offscreen Windows plugin does not always discover system fonts.
-    # Register the same installed CJK faces used by the native desktop window.
-    font_dir = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts"
-    for name in ("msyh.ttc", "msyhbd.ttc"):
-        path = font_dir / name
-        if path.exists():
-            QtGui.QFontDatabase.addApplicationFont(str(path))
-    app.setStyle("Fusion")
-    app.setStyleSheet(STYLE)
-    app.setFont(QtGui.QFont("Microsoft YaHei UI", 10))
-    pg.setConfigOptions(antialias=True, foreground="#5D708B")
+    """Apply the LabDAQ palette, fonts and pyqtgraph defaults."""
+    palette = theme.apply(app)
+    theme.configure_pyqtgraph(palette)
+    return palette
+
+
+class DeviceConnectionWorker(QtCore.QThread):
+    """Discover and connect the device without blocking the Qt event loop."""
+
+    def __init__(self, parameters, scan_first, parent):
+        super().__init__(parent)
+        self.parameters = parameters
+        self.scan_first = scan_first
+        self.engine = None
+        self.error = ""
+
+    def run(self):
+        try:
+            if self.scan_first and not enumerate_usb_devices():
+                return
+            self.engine = RemoteEngine.start_new(**self.parameters, source="usb", connect_only=True)
+        except (OSError, ValueError, RuntimeError) as exc:
+            self.error = str(exc)
 
 
 class ChannelDialog(W.QDialog):
     def __init__(self, window: "MainWindow"):
         super().__init__(window)
         self.setWindowTitle("通道与传感器配置")
-        self.resize(1150, 440)
+        self.resize(1180, 470)
         self.window = window
+        p = theme.current()
         layout = W.QVBoxLayout(self)
-        layout.setContentsMargins(22, 20, 22, 20)
+        layout.setContentsMargins(22, 20, 22, 18)
+        layout.setSpacing(12)
         layout.addWidget(label("通道与传感器", "pageTitle"))
-        layout.addWidget(label("当前 10 mV/N 为演示灵敏度。实际测量请填写传感器与调理器的换算参数。", "notice", True))
+        layout.addWidget(label("当前 10 mV/N 为演示灵敏度。实际测量请填写传感器与调理器的换算参数；"
+                               "原始电压始终保留。", "notice", True))
+        table_card, tl = card(margins=(10, 10, 10, 10), spacing=8)
         self.table = W.QTableWidget(4, 9)
-        self.table.setHorizontalHeaderLabels(["启用", "通道名称", "单位", "mV / 单位", "零点 / V", "反向", "量程", "耦合", "IEPE"])
+        self.table.setHorizontalHeaderLabels(["启用", "通道名称", "单位", "mV / 单位", "零点 / V",
+                                              "反向", "量程", "耦合", "IEPE"])
         self.table.verticalHeader().setVisible(False)
-        self.table.horizontalHeader().setSectionResizeMode(W.QHeaderView.ResizeMode.ResizeToContents)
+        self.table.setShowGrid(False)
+        self.table.setAlternatingRowColors(True)
+        self.table.horizontalHeader().setSectionResizeMode(W.QHeaderView.ResizeMode.Interactive)
         self.table.horizontalHeader().setSectionResizeMode(1, W.QHeaderView.ResizeMode.Stretch)
+        for column, width in enumerate((66, 290, 86, 118, 106, 62, 104, 92, 100)):
+            self.table.setColumnWidth(column, width)
+        self.table.setFixedHeight(4 * 48 + 40)
         self.cells = []
         for i, settings in enumerate(window.channels):
             enabled = W.QCheckBox(f"AI {i}")
@@ -179,10 +151,15 @@ class ChannelDialog(W.QDialog):
             for j, widget in enumerate(row):
                 self.table.setCellWidget(i, j, widget)
             self.table.setRowHeight(i, 48)
-        layout.addWidget(self.table)
-        layout.addWidget(label("换算：工程值 = 1000 × (原始电压[V] − 零点[V]) ÷ 灵敏度[mV/单位]。单位为 V 时不使用灵敏度；原始电压始终保留。", "muted", True))
-        buttons = W.QDialogButtonBox(W.QDialogButtonBox.StandardButton.Ok | W.QDialogButtonBox.StandardButton.Cancel)
-        buttons.button(W.QDialogButtonBox.StandardButton.Ok).setText("应用设置")
+        tl.addWidget(self.table)
+        layout.addWidget(table_card)
+        layout.addWidget(label("换算：工程值 = 1000 × (原始电压[V] − 零点[V]) ÷ 灵敏度[mV/单位]。"
+                               "单位为 V 时不使用灵敏度。", "muted", True))
+        buttons = W.QDialogButtonBox(W.QDialogButtonBox.StandardButton.Ok |
+                                     W.QDialogButtonBox.StandardButton.Cancel)
+        ok = buttons.button(W.QDialogButtonBox.StandardButton.Ok)
+        ok.setText("应用设置")
+        ok.setObjectName("primary")
         buttons.button(W.QDialogButtonBox.StandardButton.Cancel).setText("取消")
         buttons.accepted.connect(self.apply)
         buttons.rejected.connect(self.reject)
@@ -196,8 +173,9 @@ class ChannelDialog(W.QDialog):
         w = self.window
         for i, row in enumerate(self.cells):
             _, name, unit, sensitivity, zero, inverted, ranges, coupling, iepe = row
-            w.channels[i] = ChannelSettings(i, name.text().strip() or f"通道 {i}", unit.currentText().strip() or "N",
-                                           sensitivity.value(), zero.value(), inverted.isChecked())
+            w.channels[i] = ChannelSettings(i, name.text().strip() or f"通道 {i}",
+                                            unit.currentText().strip() or "N",
+                                            sensitivity.value(), zero.value(), inverted.isChecked())
             w.ranges[i] = 10.0 if ranges.currentIndex() == 0 else 1.0
             w.coupling[i] = coupling.currentText()
             w.iepe[i] = iepe.isChecked()
@@ -207,7 +185,11 @@ class ChannelDialog(W.QDialog):
 
 class MainWindow(W.QMainWindow):
     def __init__(self, *, core_endpoint=DEFAULT_ENDPOINT):
+        app = W.QApplication.instance()
+        if app is not None and not hasattr(app, "_labdaq_palette"):
+            configure_application(app)
         super().__init__()
+        self.p = theme.current()
         self.setWindowTitle("LabDAQ · 实验采集原型")
         self.resize(1450, 940)
         self.setMinimumSize(1180, 780)
@@ -224,10 +206,17 @@ class MainWindow(W.QMainWindow):
         self.recording_root = ROOT / "recordings"
         self.latest_recording: Path | None = None
         self.recording_duration_seconds: float | None = None
-        self.recording_notes = ""
         self._completion_shown: Path | None = None
         self._previous_zero: list[float] | None = None
         self._live_cache = None
+        self._live_display_key = None
+        self._preview_invalidated = False
+        self._buttons_refresh_key = None
+        self._live_follow = True
+        self._connecting = False
+        self._device_worker = None
+        self._close_after_connect = False
+        self._device_error = ""
         self.replay = None
         self.replay_path: Path | None = None
         self.replay_is_hpf = False
@@ -237,14 +226,18 @@ class MainWindow(W.QMainWindow):
         self.scenario.currentIndexChanged.connect(self._input_changed)
         self._input_changed()
         self.timer = QtCore.QTimer(self)
+        self.timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
         self.timer.timeout.connect(self.refresh)
-        self.timer.start(100)
+        self.timer.start(16)
         try:
             self.engine = RemoteEngine.reconnect(self.core_endpoint)
             if self.engine:
                 self._restore_core_session()
         except (OSError, ValueError, RuntimeError) as exc:
             self.tell(f"无法连接采集核心：{exc}")
+
+    # ------------------------------------------------------------------
+    # Window skeleton
 
     def _restore_core_session(self):
         p = self.engine.profile
@@ -253,11 +246,12 @@ class MainWindow(W.QMainWindow):
         self.active_channels = tuple(config.channels)
         self.ranges, self.coupling, self.iepe = list(config.ranges), list(config.coupling), list(config.iepe)
         self.signal_settings = SimulationSettings.from_dict(p["signal_settings"])
-        self.rate.setValue(config.sample_rate)
+        self._set_sample_rate(config.sample_rate)
         self.experiment.setText(p["experiment"])
         self._set_recording_options(p["recording_options"])
         self.recording_root = Path(p["recording_root"])
         self.directory_label.setText(str(self.recording_root))
+        self.directory_label.setToolTip(str(self.recording_root))
         self.latest_recording = self.engine.last_recording
         # Reconnect is read-only: changing the input selector must not stop the core.
         self.scenario.blockSignals(True)
@@ -278,120 +272,311 @@ class MainWindow(W.QMainWindow):
         outer = W.QHBoxLayout(central)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
-        side = W.QFrame()
-        side.setObjectName("sidebar")
-        side.setFixedWidth(196)
-        sl = W.QVBoxLayout(side)
-        sl.setContentsMargins(18, 30, 18, 24)
-        sl.addWidget(label("LabDAQ", "brand"))
-        sl.addWidget(label("实验室信号工作台", "sideCaption"))
-        sl.addSpacing(25)
-        self.nav = W.QListWidget()
-        self.nav.setObjectName("nav")
-        self.nav.addItems(["实时采集", "信号分析", "数据回看", "设备与协议"])
-        self.nav.setSpacing(2)
-        sl.addWidget(self.nav)
-        sl.addWidget(label("DT9837C", "sectionTitle"))
-        sl.addWidget(label("4 通道 · 24 bit · USB 2.0", "sideCaption"))
-        sl.addSpacing(10)
-        sl.addWidget(label("协议模拟原型  0.1\n实际硬件采集尚未启用", "sideCaption", True))
-        outer.addWidget(side)
+        outer.addWidget(self._sidebar())
         work = W.QWidget()
         work.setObjectName("workspace")
         body = W.QVBoxLayout(work)
-        body.setContentsMargins(25, 24, 25, 16)
-        body.setSpacing(18)
-        top = W.QHBoxLayout()
-        titles = W.QVBoxLayout()
-        self.title = label("实时采集", "pageTitle")
-        titles.addWidget(self.title)
-        self.subtitle = label("配置传感器，观察信号，记录每一次实验。", "muted")
-        titles.addWidget(self.subtitle)
-        top.addLayout(titles)
-        top.addStretch()
-        self.mode_badge = label("●  协议模拟 · 非真实测量", "badge")
-        top.addWidget(self.mode_badge)
-        body.addLayout(top)
+        body.setContentsMargins(22, 18, 22, 14)
+        body.setSpacing(12)
+        body.addLayout(self._header())
+        body.addWidget(self._error_banner())
         self.pages = W.QStackedWidget()
+        self.pages.setObjectName("pages")
         self.pages.addWidget(self._live_page())
         self.pages.addWidget(self._analysis_page())
         self.pages.addWidget(self._replay_page())
         self.pages.addWidget(self._device_page())
         body.addWidget(self.pages, 1)
-        self.notice = label("准备就绪 · 选择演示信号后开始预览。原始数据只在“开始记录”后保存。", "notice", True)
-        body.addWidget(self.notice)
+        body.addWidget(self._notice_strip())
         outer.addWidget(work, 1)
         self.nav.currentRowChanged.connect(self._page_changed)
         self.nav.setCurrentRow(0)
         self._sync_channel_labels()
 
+    def _sidebar(self):
+        p = self.p
+        side = W.QFrame()
+        side.setObjectName("sidebar")
+        side.setFixedWidth(212)
+        sl = W.QVBoxLayout(side)
+        sl.setContentsMargins(14, 18, 14, 14)
+        sl.setSpacing(0)
+        brand_row = W.QHBoxLayout()
+        brand_row.setSpacing(10)
+        logo = W.QLabel()
+        logo.setPixmap(theme.logo_pixmap(p, 34))
+        logo.setFixedSize(34, 34)
+        titles = W.QVBoxLayout()
+        titles.setSpacing(0)
+        titles.addWidget(label("LabDAQ", "brand"))
+        titles.addWidget(label("实验室信号工作台", "sideCaption"))
+        brand_row.addWidget(logo)
+        brand_row.addLayout(titles)
+        brand_row.addStretch()
+        sl.addLayout(brand_row)
+        sl.addSpacing(22)
+        self.nav = W.QListWidget()
+        self.nav.setObjectName("nav")
+        self.nav.addItems(NAV_TITLES)
+        self.nav.setIconSize(QtCore.QSize(18, 18))
+        self.nav.setSpacing(2)
+        self.nav.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        for index, item in enumerate([self.nav.item(i) for i in range(self.nav.count())]):
+            item.setIcon(theme.icon(NAV_ICONS[index], p.sidebar_icon, 18))
+        sl.addWidget(self.nav)
+        sl.addStretch()
+        device = W.QFrame()
+        device.setObjectName("deviceCard")
+        dl = W.QVBoxLayout(device)
+        dl.setContentsMargins(11, 10, 11, 10)
+        dl.setSpacing(5)
+        device_top = W.QHBoxLayout()
+        device_top.setSpacing(8)
+        chip = W.QLabel()
+        chip.setPixmap(theme.icon("chip", p.sidebar_icon, 17).pixmap(17, 17))
+        names = W.QVBoxLayout()
+        names.setSpacing(0)
+        names.addWidget(label("DT9837C", "deviceName"))
+        names.addWidget(label("4 通道 · 24 bit · USB 2.0", "deviceMeta"))
+        device_top.addWidget(chip)
+        device_top.addLayout(names)
+        device_top.addStretch()
+        dl.addLayout(device_top)
+        status_row = W.QHBoxLayout()
+        status_row.setSpacing(6)
+        self.side_device_dot = status_dot(p.sidebar_muted, 8)
+        self.side_device_status = label("未连接", "deviceMeta")
+        status_row.addWidget(self.side_device_dot)
+        status_row.addWidget(self.side_device_status)
+        status_row.addStretch()
+        dl.addLayout(status_row)
+        self.side_core_status = label("核心 · 未启动", "deviceMeta")
+        dl.addWidget(self.side_core_status)
+        self.reconnect_button = chip_button("重新连接", "link", self.reconnect_device)
+        self.reconnect_button.setFixedHeight(26)
+        self.reconnect_button.setToolTip("重新连接数采并进入待机，不会开始采集或记录。")
+        dl.addWidget(self.reconnect_button)
+        sl.addWidget(device)
+        sl.addSpacing(10)
+        sl.addWidget(label("内部开发版 v0.1", "sideCaption"))
+        return side
+
+    def _header(self):
+        header = W.QHBoxLayout()
+        header.setSpacing(12)
+        titles = W.QVBoxLayout()
+        titles.setSpacing(2)
+        self.title = label("实时采集", "pageTitle")
+        self.subtitle = label(PAGE_SUBTITLES[0], "pageSubtitle")
+        titles.addWidget(self.title)
+        titles.addWidget(self.subtitle)
+        header.addLayout(titles)
+        header.addStretch()
+        self.mode_badge = label("独立核心模拟", "badge")
+        header.addWidget(self.mode_badge, 0, QtCore.Qt.AlignmentFlag.AlignVCenter)
+        return header
+
+    def _error_banner(self):
+        self.error_banner = W.QFrame()
+        self.error_banner.setObjectName("errorBanner")
+        self.error_banner.setStyleSheet(
+            f"QFrame#errorBanner {{ background: {self.p.danger_soft}; border: 1px solid {self.p.danger}; border-radius: 10px; }}")
+        row = W.QHBoxLayout(self.error_banner)
+        row.setContentsMargins(14, 10, 14, 10)
+        mark = W.QLabel()
+        mark.setPixmap(theme.icon("error", self.p.danger, 23).pixmap(23, 23))
+        row.addWidget(mark)
+        texts = W.QVBoxLayout()
+        texts.setSpacing(3)
+        self.error_title = label("操作失败")
+        self.error_title.setStyleSheet(f"color: {self.p.danger}; font-size: 15px; font-weight: 600;")
+        self.error_details = label("", "muted", True)
+        self.error_details.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+        self.error_details.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        texts.addWidget(self.error_title)
+        texts.addWidget(self.error_details)
+        row.addLayout(texts, 1)
+        self.error_banner.hide()
+        return self.error_banner
+
+    def _notice_strip(self):
+        strip = W.QFrame()
+        strip.setObjectName("statusStrip")
+        layout = W.QHBoxLayout(strip)
+        layout.setContentsMargins(12, 7, 12, 7)
+        layout.setSpacing(8)
+        self.notice_icon = W.QLabel()
+        self.notice_icon.setPixmap(theme.icon("info", self.p.text_muted, 14).pixmap(14, 14))
+        self.notice = label("准备就绪 · 连接 DT9837C 后开始预览，点击“开始记录”保存原始数据。",
+                            "statusStripText", True)
+        layout.addWidget(self.notice_icon)
+        layout.addWidget(self.notice, 1)
+        return strip
+
+    def _set_nav_icons(self, index):
+        p = self.p
+        for row in range(self.nav.count()):
+            color = p.sidebar_icon_active if row == index else p.sidebar_icon
+            self.nav.item(row).setIcon(theme.icon(NAV_ICONS[row], color, 18))
+
+    @staticmethod
+    def _clear_layout(layout):
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
     def _page_changed(self, index):
         if index < 0:
             return
+        self._set_nav_icons(index)
         self.pages.setCurrentIndex(index)
-        self.title.setText(["实时采集", "信号分析", "数据回看", "设备与协议"][index])
-        self.subtitle.setText(["配置传感器，观察信号，记录每一次实验。", "从时间波形到频域，明确每一次分析的来源与单位。",
-                               "保留原始信号，让数据可以重新查看、分析和导出。", "查看设备描述符、协议命令和离线冷启动流程。"][index])
+        self.title.setText(NAV_TITLES[index])
+        self.subtitle.setText(PAGE_SUBTITLES[index])
         self._update_mode_badge()
         if index == 1:
             self.refresh_analysis()
         if index == 3:
             self.refresh_protocol()
 
+    # ------------------------------------------------------------------
+    # Live acquisition page
+
     def _live_page(self):
         page = W.QWidget()
+        page.setObjectName("pageHost")
         layout = W.QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(16)
-        metrics = W.QHBoxLayout()
-        metrics.setSpacing(12)
+        layout.setSpacing(12)
+        content = W.QHBoxLayout()
+        content.setSpacing(12)
+        left = W.QVBoxLayout()
+        left.setSpacing(12)
+        left.addLayout(self._metric_row())
+        left.addWidget(self._live_plot_card(), 1)
+        content.addLayout(left, 1)
+        content.addWidget(self._live_panel())
+        layout.addLayout(content, 1)
+        layout.addWidget(self._command_bar())
+        return page
+
+    def _metric_row(self):
+        row = W.QHBoxLayout()
+        row.setSpacing(12)
+        self.metric_cards = []
+        self.live_channel_checks = []
         self.metric_titles, self.metric_values, self.metric_subs = [], [], []
         for i in range(4):
-            frame, fl = card()
-            title = label(f"AI {i}", "muted")
-            value = label("—", "metric")
-            value.setStyleSheet(f"color: {COLORS[i]};")
-            sub = label("等待采样", "muted")
-            fl.addWidget(title)
-            fl.addWidget(value)
-            fl.addWidget(sub)
-            metrics.addWidget(frame)
-            self.metric_titles.append(title)
-            self.metric_values.append(value)
-            self.metric_subs.append(sub)
-        layout.addLayout(metrics)
-        split = W.QHBoxLayout()
-        split.setSpacing(16)
-        plot_card, pl = card()
-        plot_top = W.QHBoxLayout()
-        plot_top.addWidget(label("实时波形", "sectionTitle"))
-        plot_top.addStretch()
+            metric = MetricCard(f"AI {i}", self.p.channels[i])
+            row.addWidget(metric)
+            self.metric_cards.append(metric)
+            self.metric_titles.append(metric.title_label)
+            self.metric_values.append(metric.value_label)
+            self.metric_subs.append(metric.sub_label)
+            self.live_channel_checks.append(metric.visibility_button)
+            metric.visibility_button.toggled.connect(self._live_visibility_changed)
+        return row
+
+    def _live_plot_card(self):
+        plot_card, pl = card(margins=(15, 12, 15, 12), spacing=8)
+        header = W.QHBoxLayout()
+        header.setSpacing(8)
+        header.addWidget(section_title("实时波形", "wave"))
+        header.addStretch()
+        self.zero_button = chip_button("当前载荷归零", "zero", self.zero_channels)
+        self.zero_button.setToolTip("对所有已启用通道，以最近最多 1 秒原始电压的平均值设置零点，原始记录不变。")
+        header.addWidget(self.zero_button)
+        self.undo_zero_button = chip_button("撤销调零", "undo", self.undo_zero)
+        self.undo_zero_button.setToolTip("恢复上次调零前的零点；停止采集后仍可撤销，记录过程中不可修改。")
+        self.undo_zero_button.setEnabled(False)
+        header.addWidget(self.undo_zero_button)
+        header.addWidget(chip_button("保存图像", "save",
+                                     lambda: self.save_plot_image(self.live_plot)))
+        header.addWidget(chip_button("适应窗口", "fit", self._fit_live_plot))
+        pl.addLayout(header)
+        controls = W.QHBoxLayout()
+        controls.setSpacing(8)
+        controls.addWidget(field_label("时间轴"))
+        self.live_time_axis = W.QComboBox()
+        for title, mode in (("相对时间", "relative"), ("绝对时间", "absolute"), ("样本号", "samples")):
+            self.live_time_axis.addItem(title, mode)
+        self.live_time_axis.currentIndexChanged.connect(lambda: self._time_axis_changed("live"))
+        controls.addWidget(self.live_time_axis)
+        controls.addSpacing(6)
+        controls.addWidget(field_label("读数"))
+        self.live_value_mode = W.QComboBox()
+        for title, mode in (("最新值", "last"), ("首值", "first"), ("均值", "mean"), ("最小值", "min"),
+                            ("最大值", "max"), ("RMS", "rms"), ("标准差", "std"), ("峰峰值", "delta")):
+            self.live_value_mode.addItem(title, mode)
+        controls.addWidget(self.live_value_mode)
+        controls.addSpacing(6)
+        controls.addWidget(field_label("小数位"))
+        self.value_decimals = W.QSpinBox()
+        self.value_decimals.setRange(0, 9)
+        self.value_decimals.setValue(3)
+        self.value_decimals.setFixedWidth(50)
+        controls.addWidget(self.value_decimals)
+        controls.addWidget(field_label("窗口"))
+        self.live_seconds = W.QDoubleSpinBox()
+        self.live_seconds.setDecimals(1)
+        self.live_seconds.setRange(.1, 60)
+        self.live_seconds.setValue(10)
+        self.live_seconds.setSingleStep(1)
+        self.live_seconds.setSuffix(" s")
+        self.live_seconds.setFixedWidth(90)
+        self.live_seconds.valueChanged.connect(self._live_window_changed)
+        controls.addWidget(self.live_seconds)
+        controls.addStretch()
         self.pause_plot = W.QCheckBox("暂停滚动")
         self.pause_plot.setToolTip("只暂停曲线显示；采集和文件记录会继续。")
-        plot_top.addWidget(self.pause_plot)
-        plot_top.addWidget(button("保存图像", lambda: self.save_plot_image(self.live_plot)))
-        plot_top.addWidget(button("适应窗口", lambda: self.live_plot.enableAutoRange()))
-        pl.addLayout(plot_top)
+        pl.addLayout(controls)
         self.live_plot = plot_widget()
-        self.live_plot.addLegend(offset=(10, 8), brush=(255, 255, 255, 235), pen="#E4EAF1")
-        self.live_curves = [self.live_plot.plot(pen=pg.mkPen(c, width=1.6), name=f"AI {i}", autoDownsample=True,
-                                               downsampleMethod="peak") for i, c in enumerate(COLORS)]
+        self.live_plot.setXRange(0, self.live_seconds.value(), padding=0)
+        self.live_plot.getViewBox().sigRangeChangedManually.connect(self._live_range_changed)
+        self.live_plot.plotItem.setDownsampling(auto=True, mode="peak")
+        self.live_curves = [self.live_plot.plot(pen=pg.mkPen(c, width=1), name=f"AI {i}",
+                                                autoDownsample=True, autoDownsampleFactor=1.0,
+                                                downsampleMethod="peak")
+                            for i, c in enumerate(self.p.channels)]
         pl.addWidget(self.live_plot, 1)
-        self.live_measurements = PlotMeasurements(self.live_plot)
-        pl.addWidget(self.live_measurements)
+        footer = W.QHBoxLayout()
+        footer.addStretch()
+        footer.addWidget(self.pause_plot)
+        pl.addLayout(footer)
         self.live_info = label("时间轴来自样本序号 · 鼠标拖动平移，滚轮缩放", "muted", True)
         pl.addWidget(self.live_info)
-        split.addWidget(plot_card, 1)
-        options, ol = card()
-        options_scroll = W.QScrollArea()
-        options_scroll.setWidgetResizable(True)
-        options_scroll.setFixedWidth(280)
-        options_scroll.setFrameShape(W.QFrame.Shape.NoFrame)
-        ol.setSizeConstraint(W.QLayout.SizeConstraint.SetMinimumSize)
-        ol.addWidget(label("本次实验", "sectionTitle"))
+        return plot_card
+
+    def _live_panel(self):
+        scroll = W.QScrollArea()
+        scroll.setObjectName("panelScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFixedWidth(320)
+        scroll.setSizePolicy(W.QSizePolicy.Policy.Expanding, W.QSizePolicy.Policy.Expanding)
+        scroll.setFrameShape(W.QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        content = W.QWidget()
+        content.setObjectName("panelContent")
+        column = W.QVBoxLayout(content)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(12)
+        column.addWidget(self._acquisition_section())
+        column.addWidget(self._channel_section())
+        column.addWidget(self._config_section())
+        column.addStretch()
+        scroll.setWidget(content)
+        return scroll
+
+    def _acquisition_section(self):
+        section = CollapsibleSection("采集参数", "settings", expanded=True)
         self.experiment = W.QLineEdit("力传感器实验")
-        ol.addWidget(self.experiment)
-        ol.addWidget(label("输入来源", "muted"))
+        self.experiment.setToolTip("用于记录文件夹名称、自动分组编号和实验信息，不改变采样或传感器参数。")
+        section.add(field("实验名称", self.experiment))
+        # Retain internal sources for tests and --demo; the acquisition panel is hardware-only.
+        self.input_controls = W.QWidget(self)
+        self.input_controls.hide()
+        inputs = W.QVBoxLayout(self.input_controls)
         self.scenario = W.QComboBox()
         self.scenario.addItem("拖拽载荷 · 周期接触", "drag")
         self.scenario.addItem("正弦 · 频谱验证", "sine")
@@ -400,118 +585,187 @@ class MainWindow(W.QMainWindow):
         self.scenario.addItem("原始 HPF · 按时间回放", "hpf")
         self.scenario.addItem("独立核心 · 电信号模拟", "rust")
         self.scenario.addItem("DT9837C · 真实 USB 输入", "usb")
-        ol.addWidget(self.scenario)
+        self.scenario.setCurrentIndex(self.scenario.findData("usb"))
+        inputs.addWidget(field("输入来源", self.scenario))
         self.input_button = button("配置电信号", self.edit_input)
-        ol.addWidget(self.input_button)
+        self.input_button.setIcon(theme.icon("settings", self.p.text_muted, 15))
+        self.input_button.setIconSize(QtCore.QSize(15, 15))
+        inputs.addWidget(self.input_button)
         self.hpf_loop = W.QCheckBox("循环回放（首尾会产生接缝）")
-        ol.addWidget(self.hpf_loop)
+        inputs.addWidget(self.hpf_loop)
         self.input_info = label("", "muted", True)
-        ol.addWidget(self.input_info)
-        ol.addWidget(label("采样率 / 每通道", "muted"))
-        self.rate = W.QDoubleSpinBox()
-        self.rate.setDecimals(3)
-        self.rate.setRange(195.313, 105469)
-        self.rate.setValue(2000)
-        self.rate.setSuffix("  S/s")
-        ol.addWidget(self.rate)
+        inputs.addWidget(self.input_info)
+        self.rate = W.QComboBox()
+        for rate in (500, 1000, 2000, 5000, 10000, 20000, 50000, 100000):
+            self.rate.addItem(f"{rate / 1000:g} kS/s" + (" · 推荐" if rate == 5000 else ""), float(rate))
+        self.rate.setCurrentIndex(self.rate.findData(5000.0))
+        self.rate.currentIndexChanged.connect(self._update_live_window_limit)
+        self.rate.setToolTip("每通道同时采样。5 kS/s 为通用默认档；更高采样率适用于更快的信号，也会增加记录文件大小。")
+        section.add(field("采样率 / 每通道", self.rate))
         self.actual_rate = label("实际时钟：开始后显示", "muted")
         self.actual_rate.setToolTip("此处显示 PLL 计算出的名义采样率；晶振误差和真实时序尚未测量。")
-        ol.addWidget(self.actual_rate)
-        ol.addWidget(label("时间轴", "muted"))
-        self.live_time_axis = W.QComboBox()
-        for title, mode in (("相对时间", "relative"), ("绝对时间（电脑时钟）", "absolute"), ("样本号", "samples")):
-            self.live_time_axis.addItem(title, mode)
-        self.live_time_axis.currentIndexChanged.connect(lambda: self._time_axis_changed("live"))
-        ol.addWidget(self.live_time_axis)
-        ol.addWidget(label("数值读数（近 1 秒）", "muted"))
-        self.live_value_mode = W.QComboBox()
-        for title, mode in (("最新值", "last"), ("首值", "first"), ("均值", "mean"), ("最小值", "min"),
-                            ("最大值", "max"), ("RMS", "rms"), ("标准差", "std"), ("峰峰值", "delta")):
-            self.live_value_mode.addItem(title, mode)
-        ol.addWidget(self.live_value_mode)
-        self.value_decimals = W.QSpinBox()
-        self.value_decimals.setRange(0, 9)
-        self.value_decimals.setValue(3)
-        self.value_decimals.setPrefix("显示小数位：")
-        ol.addWidget(self.value_decimals)
-        self.channel_button = button("通道与传感器设置", self.edit_channels)
-        ol.addWidget(self.channel_button)
-        self.zero_button = button("当前载荷设为零点", self.zero_channels)
-        self.zero_button.setToolTip("以最近最多1秒原始电压的平均值设置零点，原始记录不变。")
-        ol.addWidget(self.zero_button)
-        self.undo_zero_button = button("撤销上次调零", self.undo_zero)
-        self.undo_zero_button.setEnabled(False)
-        ol.addWidget(self.undo_zero_button)
-        row = W.QHBoxLayout()
-        self.save_config_button = button("保存配置", self.save_profile)
-        self.load_config_button = button("载入配置", self.load_profile)
-        row.addWidget(self.save_config_button)
-        row.addWidget(self.load_config_button)
-        ol.addLayout(row)
-        self.record_settings_button = button("记录设置 · 时长与备注", self.edit_recording_options)
-        ol.addWidget(self.record_settings_button)
-        self.record_settings_info = label("手动结束 · 自动编号", "muted", True)
-        ol.addWidget(self.record_settings_info)
-        ol.addStretch()
-        ol.addWidget(label("记录目录", "muted"))
+        section.add(self.actual_rate)
+        self.device_button = button("连接设备", self.toggle_device_connection, "ghost")
+        self.device_button.setIcon(theme.icon("link", self.p.text_muted, 15))
+        self.device_button.setIconSize(QtCore.QSize(15, 15))
+        section.add(self.device_button)
+        return section
+
+    def _channel_section(self):
+        section = CollapsibleSection("通道与传感器", "chip", expanded=True)
+        self.channel_summary_rows, self.channel_summary_names, self.channel_summary_meta = [], [], []
+        for i in range(4):
+            row = W.QWidget()
+            row.setObjectName("transparentHost")
+            layout = W.QHBoxLayout(row)
+            layout.setContentsMargins(0, 1, 0, 1)
+            layout.setSpacing(8)
+            dot = status_dot(self.p.channels[i], 8)
+            name = label(f"AI {i}", "muted")
+            meta = label("", "faint")
+            layout.addWidget(dot)
+            layout.addWidget(name, 1)
+            layout.addWidget(meta)
+            section.add(row)
+            self.channel_summary_rows.append(row)
+            self.channel_summary_names.append(name)
+            self.channel_summary_meta.append(meta)
+        self.channel_button = button("编辑通道与传感器", self.edit_channels)
+        self.channel_button.setIcon(theme.icon("settings", self.p.text_muted, 15))
+        self.channel_button.setIconSize(QtCore.QSize(15, 15))
+        section.add(self.channel_button)
+        section.add(label("波形区可统一调零或撤销调零；原始电压不变。", "faint", True))
+        return section
+
+    def _config_section(self):
+        section = CollapsibleSection("配置与存储", "folder", expanded=False)
+        buttons = W.QHBoxLayout()
+        buttons.setSpacing(8)
+        self.save_config_button = button("保存配置", self.save_profile, "ghost")
+        self.save_config_button.setIcon(theme.icon("save", self.p.text_muted, 15))
+        self.load_config_button = button("载入配置", self.load_profile, "ghost")
+        self.load_config_button.setIcon(theme.icon("open", self.p.text_muted, 15))
+        for widget in (self.save_config_button, self.load_config_button):
+            widget.setIconSize(QtCore.QSize(15, 15))
+        buttons.addWidget(self.save_config_button)
+        buttons.addWidget(self.load_config_button)
+        section.add_layout(buttons)
+        section.add(divider())
+        section.add(field_label("记录目录"))
         self.directory_label = label(str(self.recording_root), "muted", True)
-        ol.addWidget(self.directory_label)
+        self.directory_label.setToolTip(str(self.recording_root))
+        section.add(self.directory_label)
         self.disk_space_label = label("", "muted")
-        ol.addWidget(self.disk_space_label)
+        section.add(self.disk_space_label)
         self._refresh_disk_space()
-        self.directory_button = button("更改目录", self.choose_directory)
-        ol.addWidget(self.directory_button)
-        options_scroll.setWidget(options)
-        split.addWidget(options_scroll)
-        layout.addLayout(split, 1)
-        toolbar, tl = card()
-        tr = W.QHBoxLayout()
-        self.device_button = button("连接设备", self.toggle_device_connection)
-        self.preview_button = button("开始预览", self.start_preview, "primary")
-        self.record_button = button("●  开始记录", self.toggle_record, "record")
-        self.record_button.setCheckable(True)
-        self.pause_record_button = button("暂停记录", self.toggle_record_pause)
-        self.stop_button = button("■  停止采集", self.stop_acquisition)
-        self.status_label = label("未开始", "sectionTitle")
+        self.directory_button = button("更改目录", self.choose_directory, "ghost")
+        self.directory_button.setIcon(theme.icon("folder", self.p.text_muted, 15))
+        self.directory_button.setIconSize(QtCore.QSize(15, 15))
+        section.add(self.directory_button)
+        return section
+
+    def _transport_button(self, text, icon_name, color, name="", checkable=False):
+        result = W.QPushButton(text)
+        result.setObjectName(name or "transport")
+        result.setIcon(theme.icon(icon_name, color, 16))
+        result.setIconSize(QtCore.QSize(16, 16))
+        result.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        result.setCheckable(checkable)
+        result.setMinimumHeight(36)
+        return result
+
+    def _command_bar(self):
+        bar = W.QFrame()
+        bar.setObjectName("commandBar")
+        layout = W.QVBoxLayout(bar)
+        layout.setContentsMargins(12, 9, 16, 9)
+        layout.setSpacing(7)
+        row = W.QHBoxLayout()
+        row.setSpacing(8)
+        self.preview_button = self._transport_button("开始预览", "play", self.p.accent_text, "primary")
+        self.preview_button.clicked.connect(self.start_preview)
+        self.record_button = self._transport_button("开始记录", "record", self.p.danger, "record", True)
+        self.record_button.clicked.connect(self.toggle_record)
+        self.pause_record_button = self._transport_button("暂停记录", "pause", self.p.text_muted)
+        self.pause_record_button.clicked.connect(self.toggle_record_pause)
+        self.stop_button = self._transport_button("停止采集", "stop", self.p.text_muted)
+        self.stop_button.clicked.connect(self.stop_acquisition)
+        for widget in (self.preview_button, self.record_button, self.pause_record_button, self.stop_button):
+            row.addWidget(widget)
+        row.addSpacing(4)
+        row.addWidget(theme.vdivider())
+        row.addSpacing(4)
+        row.addStretch()
+        row.addWidget(field_label("记录时长"))
+        self.duration_mode = W.QComboBox()
+        for text, seconds in (("手动结束", None), ("10 秒", 10), ("30 秒", 30),
+                              ("1 分钟", 60), ("5 分钟", 300), ("10 分钟", 600), ("自定义", "custom")):
+            self.duration_mode.addItem(text, seconds)
+        self.duration_mode.setFixedWidth(110)
+        self.duration_input = W.QDoubleSpinBox()
+        self.duration_input.setDecimals(3)
+        self.duration_input.setRange(.001, 999999999)
+        self.duration_input.setValue(60)
+        self.duration_input.setSuffix(" s")
+        self.duration_input.setFixedWidth(125)
+        self.duration_input.hide()
+        self.duration_mode.setToolTip("设置本组记录时长；达到时长后自动保存，预览继续。暂停记录期间不计时。")
+        self.duration_mode.currentIndexChanged.connect(self._duration_changed)
+        self.duration_input.valueChanged.connect(self._duration_changed)
+        row.addWidget(self.duration_mode)
+        row.addWidget(self.duration_input)
+        layout.addLayout(row)
+        summary = W.QHBoxLayout()
+        self.status_dot_label = status_dot(self.p.text_faint, 8)
+        self.status_label = status_chip("未开始", "neutral")
         self.count_label = label("0 扫描 · 0.00 s", "muted")
-        for b in [self.device_button, self.preview_button, self.record_button, self.pause_record_button, self.stop_button]:
-            tr.addWidget(b)
-        tr.addStretch()
-        tr.addWidget(self.status_label)
-        tr.addSpacing(12)
-        tr.addWidget(self.count_label)
-        tl.addLayout(tr)
-        layout.addWidget(toolbar)
-        return page
+        summary.addWidget(self.status_dot_label)
+        summary.addWidget(self.status_label)
+        summary.addStretch()
+        summary.addWidget(self.count_label)
+        layout.addLayout(summary)
+        theme.soft_shadow(bar, blur=24, dy=7, strength=16)
+        return bar
+
+    # ------------------------------------------------------------------
+    # Analysis page
 
     def _analysis_page(self):
         page = W.QWidget()
+        page.setObjectName("pageHost")
         layout = W.QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
-        frame, fl = card()
-        row = W.QHBoxLayout()
+        layout.setSpacing(12)
+        controls, cl = card(margins=(16, 13, 16, 14), spacing=10)
+        header = W.QHBoxLayout()
+        header.addWidget(section_title("分析设置", "stats"))
+        header.addStretch()
+        header.addWidget(label("窗口低通只影响分析，不修改记录", "faint"))
+        cl.addLayout(header)
         self.analysis_source = W.QComboBox()
         self.analysis_source.addItems(["实时采样窗口", "回看中的数据窗口"])
-        row.addWidget(self.analysis_source)
         self.analysis_channel = W.QComboBox()
         self.reference_channel = W.QComboBox()
         for channel_combo in (self.analysis_channel, self.reference_channel):
             channel_combo.setSizeAdjustPolicy(W.QComboBox.SizeAdjustPolicy.AdjustToContents)
         self.analysis_mode = W.QComboBox()
-        self.analysis_mode.addItems(["幅值谱 · 峰值", "功率谱密度 PSD", "频率响应 H1 / 相干性"])
+        self.analysis_mode.addItems(["幅值谱 · 峰值", "功率谱密度 PSD", "频率响应 H1 / 相干性", "时域波形 / 测量游标"])
+        self.analysis_mode.setCurrentIndex(3)
         self.window_type = W.QComboBox()
         self.window_type.addItems(["hann", "boxcar", "hamming", "blackman", "flattop"])
-        row.addStretch()
-        row.addWidget(self.analysis_channel)
-        row.addWidget(self.analysis_mode)
-        row.addWidget(self.window_type)
-        fl.addLayout(row)
+        top_row = W.QHBoxLayout()
+        top_row.setSpacing(12)
+        top_row.addWidget(field("数据来源", self.analysis_source), 1)
+        top_row.addWidget(field("分析通道", self.analysis_channel), 1)
+        top_row.addWidget(field("H1 参考通道", self.reference_channel), 1)
+        top_row.addWidget(field("分析类型", self.analysis_mode), 1)
+        top_row.addWidget(field("窗函数", self.window_type), 1)
+        cl.addLayout(top_row)
         second = W.QHBoxLayout()
-        second.addWidget(label("H1 参考通道", "muted"))
-        second.addWidget(self.reference_channel)
-        second.addSpacing(20)
+        second.setSpacing(10)
         self.lowpass = W.QCheckBox("窗口零相位低通")
-        self.lowpass.setToolTip("4 阶 Butterworth 前后向零相位滤波：有效阶数 8，填写频率处总响应约 −6 dB。仅分析窗口使用，不修改记录。")
+        self.lowpass.setToolTip("4 阶 Butterworth 前后向零相位滤波：有效阶数 8，填写频率处总响应约 −6 dB。"
+                                "仅分析窗口使用，不修改记录。")
         second.addWidget(self.lowpass)
         self.cutoff = W.QDoubleSpinBox()
         self.cutoff.setRange(0.1, 50000)
@@ -519,21 +773,37 @@ class MainWindow(W.QMainWindow):
         self.cutoff.setSuffix(" Hz")
         second.addWidget(self.cutoff)
         second.addStretch()
-        fl.addLayout(second)
+        cl.addLayout(second)
+        layout.addWidget(controls)
+        plot_card, pl = card(margins=(15, 12, 15, 12), spacing=8)
+        plot_header = W.QHBoxLayout()
+        plot_header.addWidget(section_title("分析结果", "wave"))
+        plot_header.addStretch()
+        plot_header.addWidget(label("原始文件保持不变", "faint"))
+        pl.addLayout(plot_header)
         self.analysis_plot = plot_widget("幅值", "N")
         self.analysis_plot.setLabel("bottom", "频率", units="Hz")
-        self.analysis_curve = self.analysis_plot.plot(pen=pg.mkPen(COLORS[0], width=1.5))
-        fl.addWidget(self.analysis_plot, 1)
+        self.analysis_curve = self.analysis_plot.plot(pen=pg.mkPen(self.p.channels[0], width=1))
+        pl.addWidget(self.analysis_plot, 1)
         self.coherence_plot = plot_widget("相干性", "")
         self.coherence_plot.setLabel("bottom", "频率", units="Hz")
-        self.coherence_plot.setMaximumHeight(180)
+        self.coherence_plot.setMaximumHeight(170)
         self.coherence_plot.setYRange(0, 1)
-        self.coherence_curve = self.coherence_plot.plot(pen=COLORS[1])
-        fl.addWidget(self.coherence_plot)
+        self.coherence_curve = self.coherence_plot.plot(pen=self.p.channels[1])
+        pl.addWidget(self.coherence_plot)
         self.coherence_plot.hide()
-        self.analysis_info = label("开始预览后可分析。幅值谱保留 DC；低通仅用于此页，不改变记录的原始电压。", "muted", True)
-        fl.addWidget(self.analysis_info)
-        layout.addWidget(frame, 1)
+        self.analysis_measurements = PlotMeasurements(self.analysis_plot)
+        self.analysis_measurements.channel_combo.hide()
+        self.analysis_freeze = W.QCheckBox("冻结测量窗口")
+        self.analysis_freeze.setToolTip("冻结此页的时域波形，方便拖动游标；采集和记录继续。")
+        self.analysis_freeze.toggled.connect(self.refresh_analysis)
+        self.analysis_measurements.layout().itemAt(0).layout().addWidget(self.analysis_freeze)
+        self.analysis_measurements.hide()
+        pl.addWidget(self.analysis_measurements)
+        self.analysis_info = label("开始预览后可分析。幅值谱保留 DC；低通仅用于此页，不改变记录的原始电压。",
+                                   "muted", True)
+        pl.addWidget(self.analysis_info)
+        layout.addWidget(plot_card, 1)
         for widget in [self.analysis_channel, self.reference_channel, self.analysis_mode, self.window_type]:
             widget.currentIndexChanged.connect(self.refresh_analysis)
         self.lowpass.toggled.connect(self.refresh_analysis)
@@ -541,87 +811,109 @@ class MainWindow(W.QMainWindow):
         self.analysis_source.currentIndexChanged.connect(self._analysis_source_changed)
         return page
 
+    # ------------------------------------------------------------------
+    # Replay page
+
     def _replay_page(self):
         page = W.QWidget()
+        page.setObjectName("pageHost")
         layout = W.QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
-        frame, fl = card()
-        row = W.QHBoxLayout()
-        row.addWidget(label("原始记录回看", "sectionTitle"))
-        row.addStretch()
-        row.addWidget(button("记录库", self.open_recording_library))
-        row.addWidget(button("打开记录文件夹", self.choose_replay))
-        row.addWidget(button("打开 HPF", self.choose_hpf))
-        row.addWidget(button("打开最近记录", self.open_last_recording))
-        row.addWidget(button("导出数据", self.export_replay))
-        row.addWidget(button("保存图像", lambda: self.save_plot_image(self.replay_plot)))
-        fl.addLayout(row)
-        row = W.QHBoxLayout()
-        row.addWidget(button("读取原厂 FFT 样例", self.open_vendor_sample))
-        row.addWidget(button("分析此窗口", self.analyze_replay))
-        self.replay_time_axis = W.QComboBox()
-        for title, mode in (("相对时间", "relative"), ("绝对时间（电脑时钟）", "absolute"), ("样本号", "samples")):
-            self.replay_time_axis.addItem(title, mode)
-        self.replay_time_axis.currentIndexChanged.connect(lambda: self._time_axis_changed("replay"))
-        row.addWidget(self.replay_time_axis)
-        row.addStretch()
-        row.addWidget(label("显示时长", "muted"))
-        self.replay_seconds = W.QDoubleSpinBox()
-        self.replay_seconds.setRange(.002, 60)
-        self.replay_seconds.setDecimals(3)
-        self.replay_seconds.setValue(10)
-        self.replay_seconds.setSuffix(" s")
-        self.replay_seconds.valueChanged.connect(self.draw_replay)
-        row.addWidget(self.replay_seconds)
-        fl.addLayout(row)
-        self.replay_info = label("支持原始记录、同步电压 HPF 和已验证的 DT9837C 力记录；按 HPF 原配置换算。", "notice", True)
+        layout.setSpacing(12)
+        file_card, fl = card(margins=(16, 13, 16, 13), spacing=10)
+        header = W.QHBoxLayout()
+        header.setSpacing(8)
+        header.addWidget(section_title("记录回看", "history"))
+        header.addStretch()
+        header.addWidget(chip_button("记录库", "library", self.open_recording_library))
+        header.addWidget(chip_button("打开记录文件夹", "folder", self.choose_replay))
+        header.addWidget(chip_button("打开 HPF", "open", self.choose_hpf))
+        header.addWidget(chip_button("最近记录", "history", self.open_last_recording))
+        fl.addLayout(header)
+        self.replay_info = label("支持原始记录、同步电压 HPF 和已验证的 DT9837C 力记录；按 HPF 原配置换算。",
+                                 "notice", True)
         fl.addWidget(self.replay_info)
-        row = W.QHBoxLayout()
-        row.addWidget(label("显示与取数通道", "muted"))
+        options_row = W.QHBoxLayout()
+        options_row.setSpacing(10)
+        options_row.addWidget(field_label("显示与取数通道"))
         self.replay_channel_checks = []
         for i in range(4):
             check = W.QCheckBox(f"AI {i}")
             check.setEnabled(False)
             check.toggled.connect(self.draw_replay)
             self.replay_channel_checks.append(check)
-            row.addWidget(check)
-        row.addStretch()
-        self.statistics_button = button("统计所选数据", self.show_replay_statistics)
-        row.addWidget(self.statistics_button)
-        fl.addLayout(row)
+            options_row.addWidget(check)
+        options_row.addStretch()
+        options_row.addWidget(field_label("时间轴"))
+        self.replay_time_axis = W.QComboBox()
+        for title, mode in (("相对时间", "relative"), ("绝对时间（电脑时钟）", "absolute"), ("样本号", "samples")):
+            self.replay_time_axis.addItem(title, mode)
+        self.replay_time_axis.currentIndexChanged.connect(lambda: self._time_axis_changed("replay"))
+        options_row.addWidget(self.replay_time_axis)
+        options_row.addWidget(field_label("显示时长"))
+        self.replay_seconds = W.QDoubleSpinBox()
+        self.replay_seconds.setRange(.002, 60)
+        self.replay_seconds.setDecimals(3)
+        self.replay_seconds.setValue(10)
+        self.replay_seconds.setSuffix(" s")
+        self.replay_seconds.valueChanged.connect(self.draw_replay)
+        options_row.addWidget(self.replay_seconds)
+        fl.addLayout(options_row)
+        layout.addWidget(file_card)
+        plot_card, pl = card(margins=(15, 12, 15, 12), spacing=8)
+        plot_header = W.QHBoxLayout()
+        plot_header.setSpacing(8)
+        plot_header.addWidget(section_title("回看波形", "wave"))
+        plot_header.addStretch()
+        self.statistics_button = chip_button("统计所选数据", "stats", self.show_replay_statistics)
+        plot_header.addWidget(chip_button("导出数据", "export", self.export_replay))
+        plot_header.addWidget(self.statistics_button)
+        plot_header.addWidget(chip_button("保存图像", "save",
+                                          lambda: self.save_plot_image(self.replay_plot)))
+        plot_header.addWidget(chip_button("分析此窗口", "wave", self.analyze_replay))
+        pl.addLayout(plot_header)
         self.replay_plot = plot_widget()
-        self.replay_plot.addLegend(offset=(10, 8), brush=(255, 255, 255, 235), pen="#E4EAF1")
-        self.replay_curves = [self.replay_plot.plot(pen=pg.mkPen(c, width=1.5), name=f"AI {i}",
-                                                  autoDownsample=True, downsampleMethod="peak") for i, c in enumerate(COLORS)]
-        self.replay_region = pg.LinearRegionItem(values=(0, 1), brush=(40, 120, 240, 30),
-                                                 pen=pg.mkPen("#2878F0", width=1))
+        replay_legend = self.replay_plot.addLegend(offset=(10, 8), **theme.legend_style(self.p))
+        replay_legend.setLabelTextColor(self.p.text_muted)
+        replay_legend.hide()
+        self.replay_curves = [self.replay_plot.plot(pen=pg.mkPen(c, width=1), name=f"AI {i}",
+                                                    autoDownsample=True, downsampleMethod="peak")
+                              for i, c in enumerate(self.p.channels)]
+        self.replay_region = pg.LinearRegionItem(values=(0, 1), brush=theme.alpha(self.p.accent, 0.12),
+                                                 pen=pg.mkPen(self.p.accent, width=1))
         self.replay_plot.addItem(self.replay_region, ignoreBounds=True)
         self.replay_region.hide()
         self.replay_region.sigRegionChangeFinished.connect(self._replay_region_changed)
-        fl.addWidget(self.replay_plot, 1)
+        pl.addWidget(self.replay_plot, 1)
+        self.replay_legend_row = W.QHBoxLayout()
+        self.replay_legend_row.setSpacing(16)
+        pl.addLayout(self.replay_legend_row)
         self.replay_measurements = PlotMeasurements(self.replay_plot)
-        fl.addWidget(self.replay_measurements)
-        row = W.QHBoxLayout()
-        row.addWidget(button("上一窗口", lambda: self.step_replay(-1)))
-        row.addWidget(button("下一窗口", lambda: self.step_replay(1)))
+        pl.addWidget(self.replay_measurements)
+        transport = W.QHBoxLayout()
+        transport.setSpacing(8)
+        transport.addWidget(chip_button("上一窗口", "chevron_left", lambda: self.step_replay(-1)))
+        transport.addWidget(chip_button("下一窗口", "chevron_right", lambda: self.step_replay(1)))
+        transport.addSpacing(4)
+        transport.addWidget(field_label("起点"))
         self.replay_start = W.QDoubleSpinBox()
         self.replay_start.setDecimals(9)
         self.replay_start.setRange(0, 0)
         self.replay_start.setSuffix(" s")
         self.replay_start.valueChanged.connect(self.draw_replay)
-        row.addWidget(label("起点", "muted"))
-        row.addWidget(self.replay_start)
+        transport.addWidget(self.replay_start)
         self.replay_slider = W.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.replay_slider.setRange(0, 1000)
         self.replay_slider.valueChanged.connect(self._replay_slider_changed)
-        row.addWidget(self.replay_slider, 1)
+        transport.addWidget(self.replay_slider, 1)
         self.replay_position = label("0.00 s", "muted")
-        row.addWidget(self.replay_position)
-        fl.addLayout(row)
-        row = W.QHBoxLayout()
+        transport.addWidget(self.replay_position)
+        pl.addLayout(transport)
+        selection = W.QHBoxLayout()
+        selection.setSpacing(8)
         self.replay_select = W.QCheckBox("使用选区")
         self.replay_select.toggled.connect(self._replay_selection_changed)
-        row.addWidget(self.replay_select)
+        selection.addWidget(self.replay_select)
         self.selection_start, self.selection_stop = W.QDoubleSpinBox(), W.QDoubleSpinBox()
         for spin in (self.selection_start, self.selection_stop):
             spin.setDecimals(9)
@@ -629,52 +921,86 @@ class MainWindow(W.QMainWindow):
             spin.setSuffix(" s")
             spin.setEnabled(False)
             spin.valueChanged.connect(self._replay_selection_changed)
-        row.addWidget(self.selection_start)
-        row.addWidget(label("至", "muted"))
-        row.addWidget(self.selection_stop)
-        row.addWidget(button("选当前窗口", self.select_replay_window))
-        row.addStretch()
-        fl.addLayout(row)
-        fl.addWidget(label("统计与导出使用勾选通道；未启用选区时处理全记录。选区按最近样本边界取整，右端不含。", "muted", True))
-        layout.addWidget(frame)
+        selection.addWidget(self.selection_start)
+        selection.addWidget(label("至", "muted"))
+        selection.addWidget(self.selection_stop)
+        selection.addWidget(chip_button("选当前窗口", "fit", self.select_replay_window))
+        selection.addStretch()
+        selection.addWidget(label("统计与导出使用勾选通道；未启用选区时处理全记录。", "faint"))
+        pl.addLayout(selection)
+        layout.addWidget(plot_card, 1)
         return page
+
+    # ------------------------------------------------------------------
+    # Device page
 
     def _device_page(self):
         page = W.QWidget()
+        page.setObjectName("pageHost")
         layout = W.QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
-        frame, fl = card()
-        fl.addWidget(label("独立 USB 接入研究", "sectionTitle"))
-        fl.addWidget(label("真实输入由独立核心连接 DT9837C。选择真实输入后可先连接设备，再开始预览；停止采集保持连接，断开设备关闭工作电源。扫描不改变设备配置。", "notice", True))
+        layout.setSpacing(12)
+        device_card, dl = card(margins=(16, 13, 16, 14), spacing=10)
+        dl.addWidget(section_title("设备连接", "usb"))
+        device_body = W.QHBoxLayout()
+        device_body.setSpacing(20)
+        left = W.QVBoxLayout()
+        left.setSpacing(10)
+        left.addWidget(label("真实输入由独立核心连接 DT9837C。选择真实输入后可先连接设备，再开始预览；"
+                             "停止采集保持连接，断开设备关闭工作电源。扫描不改变设备配置。", "notice", True))
         row = W.QHBoxLayout()
-        row.addWidget(button("查找 DT USB 设备", self.scan_devices))
-        row.addWidget(button("冷启动离线验证", self.simulate_boot))
-        row.addWidget(button("打开技术说明", lambda: QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(ROOT / "docs" / "开发文档" / "technical-notes.md")))))
+        row.setSpacing(8)
+        scan = button("查找 DT USB 设备", self.scan_devices, "primary")
+        scan.setIcon(theme.icon("refresh", self.p.accent_text, 15))
+        boot = button("冷启动离线验证", self.simulate_boot)
+        boot.setIcon(theme.icon("play", self.p.text_muted, 15))
+        notes = button("打开技术说明", lambda: QtGui.QDesktopServices.openUrl(
+            QtCore.QUrl.fromLocalFile(str(ROOT / "docs" / "开发文档" / "technical-notes.md"))), "ghost")
+        notes.setIcon(theme.icon("open", self.p.text_muted, 15))
+        for widget in (scan, boot, notes):
+            widget.setIconSize(QtCore.QSize(15, 15))
+        row.addWidget(scan)
+        row.addWidget(boot)
+        row.addWidget(notes)
         row.addStretch()
-        fl.addLayout(row)
+        left.addLayout(row)
+        left.addStretch()
+        right = W.QVBoxLayout()
+        right.setSpacing(8)
         self.device_result = label("尚未扫描 · 扫描只读取设备描述符，不更换驱动或初始化设备。", "muted", True)
-        fl.addWidget(self.device_result)
+        right.addWidget(self.device_result)
         self.boot_result = label("冷启动验证使用已归档固件记录，只在内存中模拟 RAM 写入与重新枚举。", "muted", True)
-        fl.addWidget(self.boot_result)
-        fl.addWidget(label("通信观察", "sectionTitle"))
+        right.addWidget(self.boot_result)
+        right.addStretch()
+        device_body.addLayout(left, 3)
+        device_body.addLayout(right, 2)
+        dl.addLayout(device_body)
+        layout.addWidget(device_card)
+        comm_card, cl = card(margins=(16, 13, 16, 14), spacing=10)
+        cl.addWidget(section_title("通信观察", "stats"))
         self.protocol_stats = label("开始预览后可查看二进制命令与传输计数。", "muted")
-        fl.addWidget(self.protocol_stats)
+        cl.addWidget(self.protocol_stats)
         self.protocol_log = W.QPlainTextEdit()
         self.protocol_log.setReadOnly(True)
-        fl.addWidget(self.protocol_log, 1)
-        row = W.QHBoxLayout()
-        row.addWidget(label("模拟故障", "muted"))
+        cl.addWidget(self.protocol_log, 1)
+        fault_row = W.QHBoxLayout()
+        fault_row.setSpacing(8)
+        fault_row.addWidget(field_label("模拟故障"))
         self.fault = W.QComboBox()
         self.fault.addItem("传输超时", "timeout")
         self.fault.addItem("设备断连", "disconnect")
         self.fault.addItem("数据溢出", "overrun")
-        row.addWidget(self.fault)
+        fault_row.addWidget(self.fault)
         self.fault_button = button("注入一次故障", self.inject_fault)
-        row.addWidget(self.fault_button)
-        row.addStretch()
-        fl.addLayout(row)
-        fl.addWidget(label("外部触发、模拟输出和多设备同步已有技术分析，本版界面尚未开放这些操作。", "muted", True))
-        layout.addWidget(frame)
+        self.fault_button.setIcon(theme.icon("warning", self.p.warning, 15))
+        self.fault_button.setIconSize(QtCore.QSize(15, 15))
+        fault_row.addWidget(self.fault_button)
+        fault_row.addStretch()
+        fault_row.addWidget(label("故障注入只适用于正在运行的协议模拟输入。", "faint"))
+        cl.addLayout(fault_row)
+        layout.addWidget(comm_card, 1)
+        layout.addWidget(label("外部触发、模拟输出和多设备同步已有技术分析，本版界面尚未开放这些操作。",
+                               "faint", True))
         return page
 
     def _selected_settings(self):
@@ -690,6 +1016,7 @@ class MainWindow(W.QMainWindow):
             self._apply_hpf_settings()
         self._refresh_input_info()
         self._update_mode_badge()
+        self._update_live_window_limit()
         self._refresh_buttons()
 
     def _refresh_input_info(self):
@@ -758,21 +1085,40 @@ class MainWindow(W.QMainWindow):
         for channel in self.input_hpf.channels:
             self.channels[channel.index] = replace(channel)
         self.ranges, self.coupling, self.iepe = list(config.ranges), list(config.coupling), list(config.iepe)
-        self.rate.setValue(config.sample_rate)  # Display only; replay uses the reader's full precision.
+        self._set_sample_rate(config.sample_rate)  # Replay keeps the file's full precision.
         self._sync_channel_labels()
 
     def _sync_channel_labels(self):
-        self.live_plot.plotItem.legend.clear()
         for i, c in enumerate(self.channels):
-            self.metric_titles[i].setText(f"AI {i}  ·  {c.name}  /  {c.unit}")
-            if i in self.active_channels:
-                self.live_plot.plotItem.legend.addItem(self.live_curves[i], f"AI {i} · {c.name}")
-            if i not in self.active_channels:
+            card = self.metric_cards[i]
+            card.title_label.setText(f"AI {i}")
+            card.name_label.setText(c.name)
+            card.unit_label.setText(c.unit)
+            self.channel_summary_names[i].setText(f"AI {i} · {c.name}")
+            self.channel_summary_meta[i].setText(f"{c.unit} · ±{self.ranges[i]:g} V")
+            active = i in self.active_channels
+            self.channel_summary_rows[i].setEnabled(active)
+            check = self.live_channel_checks[i]
+            previously_enabled = check.isEnabled()
+            with QtCore.QSignalBlocker(check):
+                check.setEnabled(active)
+                if not active or not previously_enabled:
+                    check.setChecked(active)
+            check.setText("显示" if check.isChecked() else "隐藏")
+            check.setVisible(active)
+            check.setToolTip(f"{c.name} · {c.unit}。只控制曲线显示，不改变采集和记录。")
+            self.live_curves[i].setVisible(active and check.isChecked())
+            if active:
+                card.sparkline.setVisible(True)
+            else:
                 self.metric_values[i].setText("—")
                 self.metric_subs[i].setText("未启用")
+                card.sparkline.setVisible(False)
+                card.sparkline.set_values([])
         self._analysis_source_changed()
 
     def _analysis_source_changed(self, *_):
+        self.analysis_freeze.setChecked(False)
         settings = self.replay.channels if self.analysis_source.currentIndex() == 1 and self.replay is not None else self._selected_settings()
         for combo in [self.analysis_channel, self.reference_channel]:
             previous = combo.currentData()
@@ -792,18 +1138,46 @@ class MainWindow(W.QMainWindow):
         index = self.pages.currentIndex()
         file_view = index == 2 or (index == 1 and self.analysis_source.currentIndex() == 1)
         if file_view and self.replay is not None:
-            self.mode_badge.setText("HPF 文件 · 离线回放" if self.replay_is_hpf else "记录回放 · " + ("模拟数据" if self.replay.metadata.get("source") == "simulation" else "文件数据"))
+            text = ("HPF 文件 · 离线回放" if self.replay_is_hpf else
+                    "记录回放 · " + ("模拟数据" if self.replay.metadata.get("source") == "simulation" else "文件数据"))
+            tone = "info"
         elif self.scenario.currentData() == "hpf":
-            self.mode_badge.setText("●  HPF 输入回放 · 非现场采集")
+            text, tone = "HPF 输入回放 · 非现场采集", "warning"
         elif self.scenario.currentData() == "rust":
-            self.mode_badge.setText("●  独立核心模拟 · 非真实测量")
+            text, tone = "独立核心模拟 · 非真实测量", "info"
         elif self.scenario.currentData() == "usb":
-            self.mode_badge.setText("●  DT9837C · 真实 USB 输入")
+            remote = self.engine if isinstance(self.engine, RemoteEngine) else None
+            if self._connecting:
+                text, tone = "DT9837C · 正在连接", "info"
+            elif remote and remote.connection_error:
+                text, tone = "DT9837C · 连接状态未知", "danger"
+            elif self._device_error or (remote and remote.error):
+                text, tone = "DT9837C · 连接异常", "danger"
+            elif remote and remote.device_connected:
+                text, tone = ("DT9837C · USB 采集中" if remote.running else "DT9837C · USB 待机"), "success"
+            else:
+                text, tone = "DT9837C · 未连接", "neutral"
         else:
-            self.mode_badge.setText("●  协议模拟 · 非真实测量")
+            text, tone = "协议模拟 · 非真实测量", "warning"
+        self.mode_badge.setText(text)
+        theme.set_tone(self.mode_badge, tone)
 
-    def tell(self, text):
+    def tell(self, text, tone=None, *, error_title="操作失败"):
         self.notice.setText(text)
+        if tone is None:
+            tone = ("danger" if any(word in text for word in ("失败", "无法", "错误", "中止", "中断", "异常"))
+                    else "warning" if any(word in text for word in ("请先", "尚未", "未", "不可", "不能"))
+                    else "neutral")
+        color = {"danger": self.p.danger, "warning": self.p.warning,
+                 "success": self.p.success, "info": self.p.accent}.get(tone, self.p.text_muted)
+        icon_name = {"danger": "error", "warning": "warning",
+                     "success": "check", "info": "info"}.get(tone, "info")
+        self.notice.setStyleSheet(f"color: {color};")
+        self.notice_icon.setPixmap(theme.icon(icon_name, color, 14).pixmap(14, 14))
+        if tone == "danger":
+            self.error_title.setText(error_title)
+            self.error_details.setText(text)
+            self.error_banner.show()
 
     def start_preview(self):
         self._begin_input()
@@ -816,27 +1190,74 @@ class MainWindow(W.QMainWindow):
                 self.engine.disconnect()
                 self.tell("设备已断开，工作电源已关闭。")
             else:
-                self._discard_preview()
-                config = AcquisitionConfig(sample_rate=self.rate.value(), channels=self.active_channels,
-                                           ranges=tuple(self.ranges), coupling=tuple(self.coupling), iepe=tuple(self.iepe))
-                self.engine = RemoteEngine.start_new(config, self.channels, self.signal_settings,
-                    self.experiment.text(), self.recording_root, endpoint=self.core_endpoint,
-                    source="usb", connect_only=True)
-                self._error_shown = ""
-                self.actual_rate.setText(f"名义采样率：{self.engine.sample_rate:,.3f} S/s")
-                self.tell("设备已连接，工作电源已开启；尚未采集或记录。")
+                self.reconnect_device()
         except (OSError, ValueError, RuntimeError) as exc:
             self.tell(f"设备连接操作失败：{exc}")
         self._refresh_buttons()
 
+    def auto_connect_device(self):
+        if self.scenario.currentData() != "usb":
+            return
+        if self.engine is not None and (self.engine.running or self.engine.device_connected):
+            return
+        self._connect_device(scan_first=True)
+
+    def reconnect_device(self):
+        self._connect_device(scan_first=False)
+
+    def _connect_device(self, *, scan_first):
+        if self._connecting or (self.engine is not None and self.engine.running):
+            return
+        config = AcquisitionConfig(sample_rate=self.rate.currentData(), channels=self.active_channels,
+                                   ranges=tuple(self.ranges), coupling=tuple(self.coupling), iepe=tuple(self.iepe))
+        parameters = dict(config=config, channels=[replace(c) for c in self.channels],
+                          signal_settings=self.signal_settings, experiment=self.experiment.text(),
+                          recording_root=self.recording_root, endpoint=self.core_endpoint)
+        self._connecting = True
+        self._device_error = ""
+        self.tell("正在扫描并连接 DT9837C，连接后保持待机，不会自动采集。", "info")
+        self._device_worker = DeviceConnectionWorker(parameters, scan_first, self)
+        self._device_worker.finished.connect(self._device_connection_finished)
+        self._refresh_buttons()
+        self._device_worker.start()
+
+    def _device_connection_finished(self):
+        worker = self._device_worker
+        self._connecting = False
+        if worker.engine is not None:
+            previous = self.engine
+            self.engine = worker.engine
+            self._preview_invalidated = False
+            if isinstance(previous, RemoteEngine):
+                previous.detach()
+            self._device_error = ""
+            self._error_shown = ""
+            self.error_banner.hide()
+            self.actual_rate.setText(f"名义采样率：{self.engine.sample_rate:,.3f} S/s")
+            self._update_live_window_limit()
+            self.tell("设备已连接并待机。点击“开始预览”采集，点击“开始记录”保存数据。", "success")
+        elif worker.error:
+            self._device_error = worker.error
+            self.tell(f"设备连接失败：{worker.error}", error_title="设备连接失败 · 检查 USB 后点击“重新连接”")
+        else:
+            self.tell("未检测到 DT9837C。插入设备后，点击左下角“重新连接”。", "info")
+        self._device_worker = None
+        worker.deleteLater()
+        self._refresh_buttons()
+        if self._close_after_connect:
+            self.close()
+
     def _begin_input(self, recording_path=None, *, recording_options=None):
-        if self.engine is not None and self.engine.running:
+        if self._connecting or (self.engine is not None and self.engine.running):
+            return
+        previous = self.engine
+        if self.scenario.currentData() == "usb" and not (
+                isinstance(previous, RemoteEngine) and previous.device_connected):
+            self.tell("请先点击左下角“重新连接”，设备进入绿色待机后再开始预览或记录。", "warning")
             return
         try:
-            if self.engine is not None:
-                self.engine.stop()
-                if isinstance(self.engine, RemoteEngine):
-                    self.engine.detach()
+            if previous is not None and not isinstance(previous, RemoteEngine):
+                previous.stop()
             mode = self.scenario.currentData()
             session = None
             if mode == "hpf":
@@ -845,32 +1266,39 @@ class MainWindow(W.QMainWindow):
                 config = self.input_hpf_config
                 session = HpfReplaySession(self.input_hpf, loop=self.hpf_loop.isChecked())
             else:
-                config = AcquisitionConfig(sample_rate=self.rate.value(), channels=self.active_channels,
+                config = AcquisitionConfig(sample_rate=self.rate.currentData(), channels=self.active_channels,
                                            ranges=tuple(self.ranges), coupling=tuple(self.coupling), iepe=tuple(self.iepe))
             if mode in ("rust", "usb"):
-                self.engine = RemoteEngine.start_new(config, self.channels, self.signal_settings,
+                engine = RemoteEngine.start_new(config, self.channels, self.signal_settings,
                                                       self.experiment.text(), self.recording_root, recording_path,
                                                       endpoint=self.core_endpoint,
                                                       source="usb" if mode == "usb" else "simulation",
                                                       recording_options=recording_options or self._recording_options())
             else:
-                self.engine = AcquisitionEngine(config, self._selected_settings(), mode,
+                engine = AcquisitionEngine(config, self._selected_settings(), mode,
                                                 signal_settings=self.signal_settings if mode == "custom" else None,
                                                 input_session=session)
-                self.engine.start(recording_path=recording_path, recording_options=recording_options,
+                engine.start(recording_path=recording_path, recording_options=recording_options,
                                   experiment=self.experiment.text())
+            self.engine = engine
+            self._preview_invalidated = False
+            if isinstance(previous, RemoteEngine):
+                previous.detach()
             self._error_shown = ""
+            self._device_error = ""
+            self.error_banner.hide()
             if recording_path:
                 self.latest_recording = recording_path
             self.actual_rate.setText(f"实际时钟：{self.engine.sample_rate:,.3f} S/s")
             self.actual_rate.setToolTip("HPF 文件保存的原始采样率，不重新取整。" if mode == "hpf" else "PLL 寄存器计算的名义采样率；未进行外部时钟校准。")
             self.pause_plot.setChecked(False)
-            self.live_plot.enableAutoRange()
+            self._update_live_window_limit()
+            self._fit_live_plot()
             origin = "HPF 输入回放" if mode == "hpf" else "DT9837C 真实输入" if mode == "usb" else "模拟信号"
             self.tell(f"正在记录{origin} · {recording_path}" if recording_path else
                       f"正在预览{origin} · 尚未保存。点击“开始记录”保存原始电压与本次配置。")
         except Exception as exc:
-            self.tell(f"无法开始预览：{exc}")
+            self.tell(f"无法开始预览：{exc}", error_title="无法开始采集 · 请检查设备连接和采集设置")
         self._refresh_buttons()
 
     def stop_acquisition(self):
@@ -913,38 +1341,108 @@ class MainWindow(W.QMainWindow):
         self.device_button.setVisible(self.scenario.currentData() == "usb")
         self.device_button.setText("断开设备" if connected else "连接设备")
         self.device_button.setEnabled(not running)
+        self.reconnect_button.setVisible(self.scenario.currentData() == "usb" and not connected)
+        self.reconnect_button.setEnabled(not running and not self._connecting)
         from_hpf = self.scenario.currentData() == "hpf"
-        self.preview_button.setEnabled(not running)
+        hardware_ready = self.scenario.currentData() != "usb" or connected
+        self.preview_button.setEnabled(not running and hardware_ready)
+        self.record_button.setEnabled(recording or hardware_ready)
         self.stop_button.setEnabled(running)
         self.record_button.setChecked(recording)
-        self.record_button.setText("■  结束记录" if recording else "●  开始记录")
+        self.record_button.setText("结束记录" if recording else "开始记录")
+        self.record_button.setIcon(theme.icon("stop" if recording else "record",
+                                              self.p.accent_text if recording else self.p.danger, 16))
         paused = recording and self.engine.recording_paused
         self.pause_record_button.setEnabled(recording and running)
         self.pause_record_button.setText("继续记录" if paused else "暂停记录")
+        self.pause_record_button.setIcon(theme.icon("play" if paused else "pause",
+                                                    self.p.text_muted, 16))
         for widget in [self.scenario, self.load_config_button, self.input_button, self.hpf_loop]:
             widget.setEnabled(not running)
         self.rate.setEnabled(not running and not from_hpf)
         self.channel_button.setEnabled(not running and not from_hpf)
         self.zero_button.setEnabled(running and not recording and not from_hpf)
-        self.undo_zero_button.setEnabled(running and not recording and not from_hpf and self._previous_zero is not None)
+        self.undo_zero_button.setEnabled(self.engine is not None and not recording and not from_hpf
+                                         and self._previous_zero is not None)
         self.fault_button.setEnabled(running and self.engine.transport is not None)
         self.directory_button.setEnabled(not recording)
         self.experiment.setEnabled(not recording)
-        self.record_settings_button.setEnabled(not recording)
+        self.duration_mode.setEnabled(not recording)
+        self.duration_input.setEnabled(not recording)
         ended = self.engine is not None and not self.engine.error and self.engine.termination_reason == "end_of_file"
-        self.status_label.setText("正在记录" if recording else "预览中 · 未记录" if running else
-                                  "已连接 · 未采集" if connected else "HPF 已播完" if ended else
-                                  "已断开" if self.engine and self.engine.source == "usb" else "已停止" if self.engine else "未开始")
-        if not recording and running and self.engine.termination_reason == "duration_complete":
-            self.status_label.setText("定长已完成 · 预览中")
-        if paused:
-            self.status_label.setText("记录已暂停 · 预览继续")
         if isinstance(self.engine, RemoteEngine) and self.engine.connection_error:
-            self.status_label.setText("核心连接中断 · 状态未知")
+            text, tone = "核心连接中断 · 状态未知", "danger"
             for widget in [self.preview_button, self.record_button, self.zero_button, self.scenario,
-                           self.rate, self.channel_button, self.load_config_button, self.input_button, self.device_button,
-                           self.record_settings_button, self.undo_zero_button, self.pause_record_button]:
+                           self.rate, self.channel_button, self.load_config_button, self.input_button,
+                           self.device_button, self.duration_mode, self.duration_input, self.undo_zero_button,
+                           self.pause_record_button]:
                 widget.setEnabled(False)
+        elif self._connecting:
+            text, tone = "正在连接设备", "info"
+        elif self._device_error or (self.engine is not None and self.engine.error):
+            text, tone = "设备连接异常" if self.scenario.currentData() == "usb" else "采集异常", "danger"
+        elif paused:
+            text, tone = "记录已暂停 · 预览继续", "warning"
+        elif recording:
+            text, tone = "正在记录", "danger"
+        elif running and self.engine.termination_reason == "duration_complete":
+            text, tone = "定长已完成 · 预览中", "info"
+        elif running:
+            text, tone = "预览中 · 未记录", "info"
+        elif connected:
+            text, tone = "已连接 · 未采集", "success"
+        elif ended:
+            text, tone = "HPF 已播完", "warning"
+        elif self.engine and self.engine.source == "usb":
+            text, tone = "已断开", "neutral"
+        elif self.engine:
+            text, tone = "已停止", "neutral"
+        else:
+            text, tone = "未开始", "neutral"
+        self.status_label.setText(text)
+        theme.set_tone(self.status_label, tone)
+        dot_color = theme.tone_color(self.p, tone)[0] if tone != "neutral" else self.p.text_faint
+        self.status_dot_label.setPixmap(theme.dot_pixmap(dot_color, 8))
+        if self._connecting:
+            for widget in (self.preview_button, self.record_button, self.device_button, self.reconnect_button,
+                           self.rate, self.channel_button, self.load_config_button, self.scenario):
+                widget.setEnabled(False)
+        self._update_side_status()
+        self._update_mode_badge()
+
+    def _update_side_status(self):
+        engine = self.engine
+        p = self.p
+        if self._connecting:
+            color, status, core = p.accent, "正在连接设备…", "连接后保持待机"
+        elif self._device_error:
+            color, status, core = p.danger, "设备连接失败", "检查 USB 后重新连接"
+        elif engine is None:
+            color, status, core = p.text_faint, "未连接", "核心 · 未启动"
+        elif isinstance(engine, RemoteEngine) and engine.connection_error:
+            color, status, core = p.danger, "核心连接中断", "状态未知"
+        elif isinstance(engine, RemoteEngine):
+            if engine.error:
+                color, status = p.danger, "USB 已断开" if not engine.device_connected else "设备通信异常"
+            elif engine.recording:
+                color, status = p.danger, "正在记录"
+            elif engine.running:
+                color = p.success
+                status = "采集运行中" if engine.source == "usb" else "模拟运行中"
+            elif engine.device_connected:
+                color, status = p.success, "USB 已连接 · 待机"
+            else:
+                color, status = p.warning, "已停止"
+            core = "独立核心 · 已连接" if engine.running or engine.device_connected else "核心在线 · 等待重连"
+        else:
+            color, status = p.accent, "界面内采集"
+            core = "Python 输入 · 预览"
+        self.side_device_dot.setPixmap(theme.dot_pixmap(color, 8))
+        self.side_device_status.setText(status)
+        stylesheet = f"color: {color}; font-size: 11px;"
+        if self.side_device_status.styleSheet() != stylesheet:
+            self.side_device_status.setStyleSheet(stylesheet)
+        self.side_core_status.setText(core)
 
     def toggle_record_pause(self):
         if self.engine is None or not self.engine.recording:
@@ -962,24 +1460,65 @@ class MainWindow(W.QMainWindow):
 
     def refresh(self):
         self._tick += 1
-        if self._tick % 50 == 0:
+        if self._tick % 300 == 0:
             self._refresh_disk_space()
         if self.engine is None:
             return
-        self._refresh_buttons()
+        buttons_key = (
+            self.engine, self.engine.running, self.engine.recording,
+            self.engine.recording_paused, self.engine.error, self.engine.termination_reason,
+            self.scenario.currentData(), self._previous_zero is not None,
+            self._connecting, self._device_error,
+            (self.engine.device_connected, self.engine.connection_error)
+            if isinstance(self.engine, RemoteEngine) else None,
+        )
+        if buttons_key != self._buttons_refresh_key:
+            self._refresh_buttons()
+            self._buttons_refresh_key = buttons_key
         if isinstance(self.engine, RemoteEngine) and self.engine.connection_error:
-            self.tell(self.engine.connection_error)
+            if self.engine.connection_error != self._error_shown:
+                self._error_shown = self.engine.connection_error
+                self.tell(self.engine.connection_error)
             return
         if self.engine.error and self.engine.error != self._error_shown:
             self._error_shown = self.engine.error
-            self.tell(f"采集已中止：{self.engine.error}。已有记录已尝试关闭；可重新开始预览。")
+            if isinstance(self.engine, RemoteEngine) and self.engine.source == "usb" and not self.engine.device_connected:
+                self.tell(f"数采连接已断开。插好 USB 后点击左下角“重新连接”恢复待机。详情：{self.engine.error}",
+                          "danger", error_title="数采连接已断开 · 插好 USB 后点击“重新连接”")
+            else:
+                self.tell(f"采集已中止：{self.engine.error}。已有记录已尝试关闭；可重新开始预览。")
         if (not self.engine.recording and self.engine.termination_reason == "duration_complete"
                 and self.engine.last_recording != self._completion_shown):
             self._completion_shown = self.engine.last_recording
             self.tell(f"本组定长记录已完成并保存 · {self.engine.last_recording}")
-        times, raw = self.engine.snapshot()
+        page = self.pages.currentIndex()
+        if self._preview_invalidated and page == 0:
+            return
+        if page != 0:
+            if self._tick % 30 == 0:
+                if page == 1:
+                    self.refresh_analysis()
+                elif page == 3:
+                    self.refresh_protocol()
+            return
+        # A stopped input retains its last buffer. Only redraw when samples or
+        # display/conversion settings change; hidden live widgets need no work.
+        display_key = (
+            self.engine, self.engine.total_scans, self.engine.recording,
+            self.engine.recorded_scans, self.engine.recording_remaining_scans,
+            self.live_value_mode.currentData(), self.value_decimals.value(),
+            self.live_time_axis.currentData(), self.live_seconds.value(), self.pause_plot.isChecked(),
+            self.engine.display_revision if isinstance(self.engine, RemoteEngine) else None,
+            tuple(check.isChecked() for check in self.live_channel_checks),
+            tuple((c.index, c.name, c.unit, c.sensitivity_mv_per_unit,
+                   c.zero_volts, c.inverted) for c in self._selected_settings()),
+        )
+        if display_key == self._live_display_key:
+            return
+        times, raw = self.engine.snapshot(seconds=self.live_seconds.value())
         if len(raw) == 0:
             return
+        self._live_display_key = display_key
         converted = convert_volts(raw, self._selected_settings())
         for j, i in enumerate(self.active_channels):
             c = self.channels[i]
@@ -989,10 +1528,11 @@ class MainWindow(W.QMainWindow):
                      "mean": lambda: np.mean(recent), "min": lambda: np.min(recent),
                      "max": lambda: np.max(recent), "rms": lambda: np.sqrt(np.mean(recent ** 2)),
                      "std": lambda: np.std(recent), "delta": lambda: np.ptp(recent)}[mode]()
-            self.metric_values[i].setText(f"{value:.{self.value_decimals.value()}f}")
+            self.metric_cards[i].set_value_text(f"{value:.{self.value_decimals.value()}f}")
             clipped = bool(np.any(np.abs(raw[-min(len(raw), 1000):, j]) >= self.ranges[i] * 0.9999))
-            self.metric_subs[i].setText("输入已到量程边界" if clipped else
-                                       f"{self.live_value_mode.currentText()} · 近 {len(recent) / self.engine.sample_rate:.3f} s · {c.unit}")
+            self.metric_subs[i].setText("已达量程边界" if clipped else
+                                       f"{self.live_value_mode.currentText()} · 近 {len(recent) / self.engine.sample_rate:.3f} s")
+            self.metric_cards[i].sparkline.set_values(recent)
         if not self.pause_plot.isChecked():
             self._live_cache = times, raw
             self._draw_live(times, raw)
@@ -1011,10 +1551,6 @@ class MainWindow(W.QMainWindow):
             if epoch is not None:
                 timing = " · 当前 " + datetime.fromtimestamp(epoch + times[-1]).astimezone().isoformat(timespec="milliseconds")
         self.live_info.setText(f"{origin} · {len(self.active_channels)} 路 · {self.engine.sample_rate:,.3f} S/s/通道 · 已记录 {self.engine.recorded_scans:,} 扫描{timing}")
-        if self._tick % 5 == 0 and self.pages.currentIndex() == 1:
-            self.refresh_analysis()
-        if self._tick % 5 == 0 and self.pages.currentIndex() == 3:
-            self.refresh_protocol()
 
     @staticmethod
     def _timestamp(value):
@@ -1041,6 +1577,7 @@ class MainWindow(W.QMainWindow):
         absolute = mode == "absolute" and epoch is not None
         if absolute != isinstance(plot.getAxis("bottom"), pg.DateAxisItem):
             plot.setAxisItems({"bottom": pg.DateAxisItem() if absolute else pg.AxisItem("bottom")})
+            theme.style_plot(plot, theme.current())
         if absolute:
             plot.setLabel("bottom", "电脑时钟（本地时间）")
             return epoch + times
@@ -1052,8 +1589,8 @@ class MainWindow(W.QMainWindow):
 
     def _time_axis_changed(self, source):
         combo = self.live_time_axis if source == "live" else self.replay_time_axis
-        measurements = self.live_measurements if source == "live" else self.replay_measurements
-        cursor_times = measurements.measurements.get("times")
+        measurements = self.replay_measurements if source == "replay" else None
+        cursor_times = measurements.measurements.get("times") if measurements is not None else None
         epoch = (self._timestamp(self.engine.acquisition_started_at_utc) if self.engine else None) if source == "live" else self._replay_epoch()
         available = self.engine is not None if source == "live" else self.replay is not None
         if available and combo.currentData() == "absolute" and epoch is None:
@@ -1062,6 +1599,7 @@ class MainWindow(W.QMainWindow):
             combo.blockSignals(False)
             self.tell("此输入没有可用的绝对起点，使用相对时间；不会以文件修改时间代替。")
         if source == "live":
+            self._live_follow = True
             if self._live_cache is not None:
                 self._draw_live(*self._live_cache)
         elif self.replay is not None:
@@ -1074,18 +1612,69 @@ class MainWindow(W.QMainWindow):
 
     def _draw_live(self, times, raw):
         channels = self._selected_settings()
-        units = {c.unit for c in channels}
+        units = {c.unit for c in channels if self.live_channel_checks[c.index].isChecked()}
         unit = next(iter(units)) if len(units) == 1 else "V"
         self.live_plot.setLabel("left", "工程值" if len(units) == 1 else "原始电压", units=unit)
         values = convert_volts(raw, channels) if len(units) == 1 else raw
         epoch = self._timestamp(self.engine.acquisition_started_at_utc)
         x = self._time_axis_values(self.live_plot, times, self.live_time_axis.currentData(), epoch, self.engine.sample_rate)
         for i, curve in enumerate(self.live_curves):
-            if i in self.active_channels:
+            visible = i in self.active_channels and self.live_channel_checks[i].isChecked()
+            curve.setVisible(visible)
+            if visible:
                 curve.setData(x, values[:, self.active_channels.index(i)])
             else:
                 curve.setData([], [])
-        self.live_measurements.set_data(times, values, [(f"AI {c.index} · {c.name}", unit) for c in channels], x_values=x)
+        if self._live_follow and len(times):
+            span = self.live_seconds.value()
+            end = max(span, times[-1] + 1 / self.engine.sample_rate)
+            bounds = np.array([end - span, end])
+            mode = self.live_time_axis.currentData()
+            if mode == "absolute" and epoch is not None:
+                bounds += epoch
+            elif mode == "samples":
+                bounds *= self.engine.sample_rate
+            self.live_plot.setXRange(*bounds, padding=0)
+
+    def _live_visibility_changed(self, *_):
+        self._live_display_key = None
+        if self._live_cache is not None:
+            self._draw_live(*self._live_cache)
+        self.live_plot.enableAutoRange(axis="y")
+
+    def _live_range_changed(self, axes):
+        if axes[0]:
+            self._live_follow = False
+
+    def _fit_live_plot(self):
+        self._live_follow = True
+        self.live_plot.enableAutoRange(axis="y")
+        if self._live_cache is not None:
+            self._draw_live(*self._live_cache)
+        else:
+            self.live_plot.setXRange(0, self.live_seconds.value(), padding=0)
+
+    def _live_window_changed(self, *_):
+        if isinstance(self.engine, RemoteEngine):
+            self.engine.display_seconds = self.live_seconds.value()
+        self._live_display_key = None
+        self._fit_live_plot()
+
+    def _update_live_window_limit(self, *_):
+        rate = self.engine.sample_rate if self.engine is not None else plan_clock(self.rate.currentData()).actual_rate
+        limit = math.floor(min(60, 200000 / rate) * 10) / 10
+        self.live_seconds.setMaximum(limit)
+        self.live_seconds.setToolTip(f"横轴显示时长，满窗后滚动。当前采样率最多显示 {limit:g} 秒（每通道最多 200,000 点）。不影响记录时长。")
+        if isinstance(self.engine, RemoteEngine):
+            self.engine.display_seconds = self.live_seconds.value()
+
+    def _set_sample_rate(self, rate):
+        index = self.rate.findData(rate)
+        if index < 0:
+            self.rate.addItem(f"{rate:g} S/s · 已载入", rate)
+            index = self.rate.count() - 1
+        self.rate.setCurrentIndex(index)
+        self._update_live_window_limit()
 
     def zero_channels(self):
         if self.engine is None or not self.engine.running or self.engine.recording:
@@ -1105,10 +1694,14 @@ class MainWindow(W.QMainWindow):
                 return
         self._previous_zero = previous
         self._refresh_buttons()
-        self.tell("已将最近最多 1 秒的平均电压设为零点。请在实际实验中确认此时为空载；原始电压未修改。")
+        self.refresh()
+        if self.pause_plot.isChecked() and self._live_cache is not None:
+            self._draw_live(*self._live_cache)
+        self.live_plot.enableAutoRange(axis="y")
+        self.tell("已将最近最多 1 秒的平均电压设为零点，可点击“撤销调零”恢复。请确认此时为空载；原始电压未修改。")
 
     def undo_zero(self):
-        if self.engine is None or not self.engine.running or self.engine.recording or self._previous_zero is None:
+        if self.engine is None or self.engine.recording or self._previous_zero is None:
             return
         channels = [replace(c, zero_volts=zero) for c, zero in zip(self.channels, self._previous_zero)]
         if isinstance(self.engine, RemoteEngine):
@@ -1120,19 +1713,33 @@ class MainWindow(W.QMainWindow):
         self.channels = channels
         self._previous_zero = None
         self._refresh_buttons()
+        self.refresh()
+        if self.pause_plot.isChecked() and self._live_cache is not None:
+            self._draw_live(*self._live_cache)
+        self.live_plot.enableAutoRange(axis="y")
         self.tell("已恢复上次调零前的零点；原始电压未修改。")
 
     def edit_channels(self):
         if ChannelDialog(self).exec() == W.QDialog.DialogCode.Accepted:
-            self._discard_preview()
+            self._discard_preview(keep_device_connected=True)
             self._sync_channel_labels()
-            self.tell("通道设置已更新。开始预览后生效。")
+            self.count_label.setText("等待采样")
+            self.live_info.setText("通道设置已更新，开始预览后生效。")
+            connected = isinstance(self.engine, RemoteEngine) and self.engine.device_connected
+            self.tell("通道设置已更新，设备保持连接。直接开始预览后生效。" if connected else
+                      "通道设置已更新。开始预览后生效。")
 
-    def _discard_preview(self):
+    def _discard_preview(self, *, keep_device_connected=False):
         self._previous_zero = None
         self._live_cache = None
-        self.live_measurements.set_data([], np.empty((0, 0)), [])
-        if self.engine:
+        self._live_display_key = None
+        # A retained USB session still holds samples from the previous channel map.
+        # Keep polling connection health, but display no old samples until restart.
+        self._live_follow = True
+        keep_connection = (keep_device_connected and isinstance(self.engine, RemoteEngine)
+                           and self.engine.source == "usb")
+        self._preview_invalidated = keep_connection
+        if self.engine and not keep_connection:
             self.engine.stop()
             if isinstance(self.engine, RemoteEngine):
                 self.engine.shutdown()
@@ -1143,6 +1750,9 @@ class MainWindow(W.QMainWindow):
             metric.setText("—")
         for sub in self.metric_subs:
             sub.setText("等待采样")
+        for card in getattr(self, "metric_cards", []):
+            card.sparkline.set_values([])
+        self.live_plot.setXRange(0, self.live_seconds.value(), padding=0)
         self._clear_analysis()
         self._refresh_buttons()
 
@@ -1163,41 +1773,23 @@ class MainWindow(W.QMainWindow):
 
     def _recording_options(self, group_number=0):
         return {"duration_seconds": self.recording_duration_seconds,
-                "notes": self.recording_notes, "group_number": group_number}
+                "group_number": group_number}
 
     def _set_recording_options(self, options):
-        self.recording_duration_seconds = options.get("duration_seconds")
-        self.recording_notes = options.get("notes", "")
-        duration = self.recording_duration_seconds
-        self.record_settings_info.setText(
-            (f"定长 {duration:g} s" if duration is not None else "手动结束") + " · 自动编号"
-            + (" · 已填备注" if self.recording_notes else ""))
+        duration = options.get("duration_seconds")
+        with QtCore.QSignalBlocker(self.duration_mode), QtCore.QSignalBlocker(self.duration_input):
+            index = self.duration_mode.findData(duration)
+            if index < 0:
+                index = self.duration_mode.findData("custom")
+                self.duration_input.setValue(duration)
+            self.duration_mode.setCurrentIndex(index)
+        self._duration_changed()
 
-    def edit_recording_options(self):
-        dialog = W.QDialog(self)
-        dialog.setWindowTitle("本组记录设置")
-        dialog.setMinimumWidth(440)
-        layout = W.QVBoxLayout(dialog)
-        form = W.QFormLayout()
-        duration = W.QDoubleSpinBox()
-        duration.setDecimals(3)
-        duration.setRange(0, 999999999)
-        duration.setSuffix(" s")
-        duration.setSpecialValueText("手动结束")
-        duration.setValue(self.recording_duration_seconds or 0)
-        form.addRow("记录时长（0 为手动）", duration)
-        notes = W.QPlainTextEdit(self.recording_notes)
-        notes.setMaximumHeight(120)
-        form.addRow("本组备注", notes)
-        layout.addLayout(form)
-        layout.addWidget(label("每组按日期与实验名自动编号。定长按实际采样率换算为整数帧；完成后保存并继续预览。", "muted", True))
-        buttons = W.QDialogButtonBox(W.QDialogButtonBox.StandardButton.Ok | W.QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-        if dialog.exec() == W.QDialog.DialogCode.Accepted:
-            self._set_recording_options({"duration_seconds": duration.value() or None,
-                                         "notes": notes.toPlainText()})
+    def _duration_changed(self, *_):
+        duration = self.duration_mode.currentData()
+        custom = duration == "custom"
+        self.duration_input.setVisible(custom)
+        self.recording_duration_seconds = self.duration_input.value() if custom else duration
 
     def save_profile(self):
         path, _ = W.QFileDialog.getSaveFileName(self, "保存实验配置", str(ROOT / "实验配置.json"), "JSON 配置 (*.json)")
@@ -1207,13 +1799,13 @@ class MainWindow(W.QMainWindow):
     def save_profile_to(self, path: Path):
         data = {"schema": "labdaq-profile-v1", "channels": [asdict(c) for c in self.channels],
                 "active_channels": self.active_channels, "ranges": self.ranges, "coupling": self.coupling,
-                "iepe": self.iepe, "sample_rate": self.rate.value(), "scenario": self.scenario.currentData(),
+                "iepe": self.iepe, "sample_rate": self.rate.currentData(), "scenario": self.scenario.currentData(),
                 "experiment": self.experiment.text(), "signal_settings": self.signal_settings.to_dict(),
                 "recording_options": self._recording_options(),
                 "display": {"live_time_axis": self.live_time_axis.currentData(),
                             "replay_time_axis": self.replay_time_axis.currentData(),
                             "value_mode": self.live_value_mode.currentData(),
-                            "value_decimals": self.value_decimals.value()},
+                            "value_decimals": self.value_decimals.value(), "live_seconds": self.live_seconds.value()},
                 "input_hpf": str(self.input_hpf.path.resolve()) if self.input_hpf else None,
                 "hpf_loop": self.hpf_loop.isChecked()}
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1245,8 +1837,6 @@ class MainWindow(W.QMainWindow):
         if duration is not None and (not isinstance(duration, (int, float)) or isinstance(duration, bool)
                                      or not math.isfinite(duration) or not 0 < duration <= 999999999):
             raise ValueError("记录时长必须为正的有限秒数，手动结束使用 null")
-        if not isinstance(options.get("notes", ""), str):
-            raise ValueError("记录备注必须为文字")
         display = data.get("display", {})
         for key, combo, default in (("live_time_axis", self.live_time_axis, "relative"),
                                     ("replay_time_axis", self.replay_time_axis, "relative"),
@@ -1256,6 +1846,10 @@ class MainWindow(W.QMainWindow):
         decimals = display.get("value_decimals", 3)
         if type(decimals) is not int or not 0 <= decimals <= 9:
             raise ValueError("显示小数位必须是 0 到 9 的整数")
+        live_seconds = display.get("live_seconds", 10)
+        if (isinstance(live_seconds, bool) or not isinstance(live_seconds, (int, float))
+                or not math.isfinite(live_seconds) or not .1 <= live_seconds <= 60):
+            raise ValueError("横轴显示时长必须在 0.1 到 60 秒之间")
         reader = None
         if mode == "hpf":
             from .hpf import open_hpf
@@ -1277,7 +1871,7 @@ class MainWindow(W.QMainWindow):
         if reader is not None:
             self.input_hpf, self.input_hpf_config = reader, config
         self.ranges, self.coupling, self.iepe = list(config.ranges), list(config.coupling), list(config.iepe)
-        self.rate.setValue(config.sample_rate)
+        self._set_sample_rate(config.sample_rate)
         self.hpf_loop.setChecked(data.get("hpf_loop", False))
         self.scenario.setCurrentIndex(self.scenario.findData(mode))
         self._input_changed()
@@ -1287,11 +1881,27 @@ class MainWindow(W.QMainWindow):
         self.replay_time_axis.setCurrentIndex(self.replay_time_axis.findData(display.get("replay_time_axis", "relative")))
         self.live_value_mode.setCurrentIndex(self.live_value_mode.findData(display.get("value_mode", "last")))
         self.value_decimals.setValue(decimals)
+        self.live_seconds.setValue(live_seconds)
         self._sync_channel_labels()
         self.tell(f"配置已载入 · {path.name}")
 
     def refresh_analysis(self, *_):
         if not hasattr(self, "analysis_info"):
+            return
+        mode = self.analysis_mode.currentIndex()
+        time_domain = mode == 3
+        if mode != getattr(self, "_analysis_plot_mode", None):
+            self.analysis_plot.enableAutoRange()
+            self.analysis_plot.setLabel("bottom", "相对时间" if time_domain else "频率",
+                                        units="s" if time_domain else "Hz")
+            self._analysis_plot_mode = mode
+        self.analysis_measurements.setVisible(time_domain)
+        for line in self.analysis_measurements.cursor_lines:
+            line.setVisible(time_domain and self.analysis_measurements.enabled_checkbox.isChecked())
+        self.reference_channel.setEnabled(mode == 2)
+        self.window_type.setEnabled(not time_domain)
+        if (time_domain and self.analysis_freeze.isChecked() and not _
+                and self.analysis_curve.xData is not None and len(self.analysis_curve.xData)):
             return
         from_replay = self.analysis_source.currentIndex() == 1
         if from_replay:
@@ -1302,25 +1912,29 @@ class MainWindow(W.QMainWindow):
             raw, start, reader = self._replay_window()
             fs, settings = self.replay.sample_rate, self.replay.channels
         else:
-            if self.engine is None:
+            if self.engine is None or self._preview_invalidated:
                 self._clear_analysis()
+                self.analysis_info.setText("等待开始预览。")
                 return
-            _, raw = self.engine.snapshot(seconds=8)
+            times, raw = self.engine.snapshot(seconds=self.live_seconds.value() if time_domain else 8)
             fs, settings = self.engine.sample_rate, self._selected_settings()
-        if len(raw) < 32:
+        if len(raw) < (1 if time_domain else 32):
             self._clear_analysis()
             self.analysis_info.setText("等待至少 32 个扫描点。")
             return
         # Fixed upper bound keeps plotting and analysis responsive at high rates.
         original_length = len(raw)
-        raw = raw[-65536:]
+        raw = raw[-(200000 if time_domain else 65536):]
         if from_replay:
             analysis_start = start + max(0, original_length - len(raw))
             times = self._replay_times(reader, analysis_start, len(raw))
-            if np.any(np.diff(times) > 1.5 / fs):
-                self._clear_analysis()
-                self.analysis_info.setText("当前窗口包含暂停缺口，请选择一个连续段再分析。")
-                return
+        else:
+            times = times[-len(raw):]
+        has_gaps = bool(np.any(np.diff(times) > 1.5 / fs))
+        if has_gaps and (not time_domain or self.lowpass.isChecked()):
+            self._clear_analysis()
+            self.analysis_info.setText("当前窗口包含暂停缺口，请选择一个连续段再分析或关闭低通查看时域波形。")
+            return
         values = convert_volts(raw, settings)
         indices = [c.index for c in settings]
         selected = self.analysis_channel.currentData()
@@ -1328,11 +1942,21 @@ class MainWindow(W.QMainWindow):
         if selected not in indices:
             return
         idx = indices.index(selected)
-        mode = self.analysis_mode.currentIndex()
         try:
             if self.lowpass.isChecked():
                 values = filter_window(values, fs, self.cutoff.value())
-            if mode == 2:
+            if time_domain:
+                f = times
+                y = values[:, idx]
+                self.analysis_plot.setLabel("bottom", "相对时间", units="s")
+                self.analysis_plot.setLabel("left", "工程值", units=settings[idx].unit)
+                self.coherence_plot.hide()
+                gaps = np.flatnonzero(np.diff(times) > 1.5 / fs) + 1
+                x = np.insert(times, gaps, times[gaps])
+                plotted = np.insert(y, gaps, np.nan)
+                self.analysis_measurements.set_data(
+                    x, plotted[:, None], [(f"AI {selected} · {settings[idx].name}", settings[idx].unit)])
+            elif mode == 2:
                 if selected == reference:
                     self._clear_analysis()
                     self.analysis_info.setText("请选择不同的参考与响应通道。")
@@ -1348,11 +1972,17 @@ class MainWindow(W.QMainWindow):
                 f, y = spectrum(values[:, idx], fs, mode="amplitude" if mode == 0 else "psd", window=self.window_type.currentText())
                 self.analysis_plot.setLabel("left", "峰值幅度" if mode == 0 else "功率谱密度", units=settings[idx].unit if mode == 0 else f"{settings[idx].unit}²/Hz")
                 self.coherence_plot.hide()
-            self.analysis_curve.setPen(pg.mkPen(COLORS[selected], width=1.5))
-            self.analysis_curve.setData(f, y)
+            self.analysis_curve.setPen(pg.mkPen(self.p.channels[selected], width=1))
+            if time_domain:
+                self.analysis_curve.setData(x, plotted, connect="finite", autoDownsample=True,
+                                            downsampleMethod="peak")
+            else:
+                self.analysis_plot.setLabel("bottom", "频率", units="Hz")
+                self.analysis_curve.setData(f, y, connect="all")
             signal = values[:, idx]
             origin = "回看窗口" if from_replay else "实时窗口"
-            self.analysis_info.setText(f"{origin} · {len(signal):,} 点 · 均值 {np.mean(signal):.4f} · RMS {np.sqrt(np.mean(signal**2)):.4f} · 峰峰值 {np.ptp(signal):.4f} {settings[idx].unit}  |  原始文件保持不变")
+            gaps_note = " · 含暂停缺口，曲线按真实时间断开" if has_gaps else ""
+            self.analysis_info.setText(f"{origin} · {len(signal):,} 点 · 均值 {np.mean(signal):.4f} · RMS {np.sqrt(np.mean(signal**2)):.4f} · 峰峰值 {np.ptp(signal):.4f} {settings[idx].unit}{gaps_note}  |  原始文件保持不变")
         except (ValueError, TypeError) as exc:
             self._clear_analysis()
             self.analysis_info.setText(f"分析设置：{exc}")
@@ -1361,6 +1991,9 @@ class MainWindow(W.QMainWindow):
         self.analysis_curve.setData([], [])
         self.coherence_curve.setData([], [])
         self.coherence_plot.hide()
+        self.analysis_measurements.set_data([], np.empty((0, 0)), [])
+        for line in self.analysis_measurements.cursor_lines:
+            line.hide()
 
     def choose_replay(self):
         result = W.QFileDialog.getExistingDirectory(self, "打开包含 metadata.json 的记录文件夹", str(self.recording_root))
@@ -1396,12 +2029,15 @@ class MainWindow(W.QMainWindow):
             self.replay = reader
             self.replay_is_hpf = is_hpf
             self.replay_path = path
+            self._replay_legend_key = None
             for i, check in enumerate(self.replay_channel_checks):
                 channel = next((c for c in reader.channels if c.index == i), None)
                 check.blockSignals(True)
                 check.setEnabled(channel is not None)
                 check.setChecked(channel is not None)
-                check.setText(f"AI {i} · {channel.name}" if channel else f"AI {i}")
+                text = f"AI {i} · {channel.name}" if channel else f"AI {i}"
+                check.setText(text if len(text) <= 18 else text[:17] + "…")
+                check.setToolTip(channel.name if channel else "")
                 check.blockSignals(False)
             duration = getattr(reader, "elapsed_duration", reader.duration)
             for spin, value in ((self.selection_start, 0), (self.selection_stop, duration)):
@@ -1506,6 +2142,17 @@ class MainWindow(W.QMainWindow):
             raise ValueError("所选区间至少需要一个样本，起点必须小于终点")
         return start, stop, channels
 
+    def _sync_replay_legend(self, visible):
+        key = tuple(channel.index for channel in visible)
+        if key == getattr(self, "_replay_legend_key", None):
+            return
+        self._replay_legend_key = key
+        self._clear_layout(self.replay_legend_row)
+        for channel in visible:
+            self.replay_legend_row.addWidget(
+                legend_chip(f"AI {channel.index} · {channel.name}", self.p.channels[channel.index]))
+        self.replay_legend_row.addStretch()
+
     def draw_replay(self, *_):
         if self.replay is None:
             return
@@ -1531,11 +2178,12 @@ class MainWindow(W.QMainWindow):
         self.replay_plot.plotItem.legend.clear()
         for j, curve in enumerate(self.replay_curves):
             if j < len(r.channels) and self.replay_channel_checks[r.channels[j].index].isChecked():
-                curve.setPen(pg.mkPen(COLORS[r.channels[j].index], width=1.5))
+                curve.setPen(pg.mkPen(self.p.channels[r.channels[j].index], width=1))
                 curve.setData(plot_x, plot_values[:, j], connect="finite")
                 self.replay_plot.plotItem.legend.addItem(curve, f"AI {r.channels[j].index} · {r.channels[j].name}")
             else:
                 curve.setData([], [])
+        self._sync_replay_legend(visible)
         self.replay_plot.enableAutoRange()
         columns = [j for j, c in enumerate(r.channels) if c in visible]
         unit = next(iter(units)) if len(units) == 1 else "V"
@@ -1666,6 +2314,10 @@ class MainWindow(W.QMainWindow):
             self.tell("故障注入只适用于正在运行的协议模拟输入。")
 
     def closeEvent(self, event):
+        if self._connecting:
+            self._close_after_connect = True
+            event.ignore()
+            return
         self.timer.stop()
         if isinstance(self.engine, RemoteEngine):
             if not self.engine.running and not self.engine.connection_error:
@@ -1687,8 +2339,10 @@ def main():
     configure_application(app)
     window = MainWindow()
     if window.engine is None:
-        window.scenario.setCurrentIndex(window.scenario.findData("rust"))
+        window.scenario.setCurrentIndex(window.scenario.findData("rust" if args.demo else "usb"))
     window.show()
     if args.demo:
         QtCore.QTimer.singleShot(100, window.start_preview)
+    else:
+        QtCore.QTimer.singleShot(100, window.auto_connect_device)
     return app.exec()

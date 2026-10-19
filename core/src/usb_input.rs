@@ -375,6 +375,12 @@ impl UsbInput {
         self.fault.lock().unwrap().clone()
     }
 
+    pub fn check_connection(&self) -> Result<(), Fault> {
+        let handle = self.handle.as_ref()
+            .ok_or_else(|| Fault::new("device_disconnected", "设备尚未连接"))?;
+        read_word(handle, 0).map(|_| ())
+    }
+
     pub fn stop(&mut self) -> Result<(), Fault> {
         let mut error = None;
         if let Some(h) = &self.handle {

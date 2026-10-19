@@ -9,13 +9,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+
+const SIMULATION_BLOCK_SECONDS: f64 = 1.0 / 60.0;
 
 #[derive(Clone, Copy, Default, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -251,6 +253,8 @@ enum Command {
     Poll {
         #[serde(default)]
         seconds: f64,
+        #[serde(default)]
+        after_scan: Option<u64>,
     },
     Connect {
         profile: Box<Profile>,
@@ -302,6 +306,7 @@ struct State {
     previous_y: [f64; 4],
     error: String,
     termination_reason: String,
+    last_device_check: Instant,
 }
 
 impl State {
@@ -324,13 +329,19 @@ impl State {
             previous_y: [0.0; 4],
             error: String::new(),
             termination_reason: "user_stop".into(),
+            last_device_check: Instant::now(),
         }
     }
 
-    fn poll(&self, seconds: f64) -> Value {
+    fn poll(&self, seconds: f64, after_scan: Option<u64>) -> Value {
         let width = self.profile.as_ref().map_or(1, |p| p.config.channels.len());
         let rate = self.profile.as_ref().map_or(1.0, |p| p.actual_rate);
-        let n = ((seconds.clamp(0.0, 12.0) * rate).round() as usize).min(self.ring.len() / width);
+        let n = ((seconds.clamp(0.0, 60.0) * rate).round() as usize).min(self.ring.len() / width);
+        let start = self.total_scans - n as u64;
+        let start = after_scan
+            .filter(|&scan| scan <= self.total_scans)
+            .map_or(start, |scan| scan.max(start));
+        let n = (self.total_scans - start) as usize;
         let raw: Vec<f64> = self
             .ring
             .iter()
@@ -398,7 +409,18 @@ impl State {
 
     fn command(&mut self, command: Command) -> Result<Value, String> {
         match command {
-            Command::Poll { seconds } => return Ok(self.poll(seconds)),
+            Command::Poll { seconds, after_scan } => {
+                if !self.running && self.usb.is_some()
+                    && self.last_device_check.elapsed() >= Duration::from_millis(500)
+                {
+                    self.last_device_check = Instant::now();
+                    if let Some(error) = self.usb.as_ref().and_then(|usb| usb.check_connection().err()) {
+                        self.fail(error);
+                        self.stop_input(false);
+                    }
+                }
+                return Ok(self.poll(seconds, after_scan));
+            }
             Command::Connect { mut profile } => {
                 if self.running || self.usb.is_some() {
                     return Err("核心已在采集或设备已经连接，请接回当前会话".into());
@@ -449,7 +471,7 @@ impl State {
                 };
                 *self = Self::new();
                 self.usb = usb;
-                self.capacity = ((profile.actual_rate * 12.0).round() as usize).clamp(1, 200000);
+                self.capacity = ((profile.actual_rate * 60.0).round() as usize).clamp(1, 200000);
                 self.ring = VecDeque::with_capacity(self.capacity * profile.config.channels.len());
                 self.profile = Some(*profile);
                 self.running = true;
@@ -513,7 +535,7 @@ impl State {
                 self.stop_input(false);
             }
         }
-        Ok(self.poll(0.0))
+        Ok(self.poll(0.0, None))
     }
 
     fn fail(&mut self, fault: usb_input::Fault) {
@@ -582,7 +604,7 @@ impl State {
     fn sample_simulation(&mut self) -> Result<(), String> {
         let p = self.profile.as_ref().unwrap();
         let width = p.config.channels.len();
-        let count = (p.actual_rate * 0.05).round().max(1.0) as usize;
+        let count = (p.actual_rate * SIMULATION_BLOCK_SECONDS).round().max(1.0) as usize;
         let alpha = 1.0 / (1.0 + std::f64::consts::TAU / p.actual_rate);
         let mut values = Vec::with_capacity(count * width);
         for offset in 0..count {
@@ -649,6 +671,7 @@ fn serve(
     token: &str,
     sender: &SyncSender<Envelope>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_secs(1)))?;
     stream.set_write_timeout(Some(Duration::from_secs(1)))?;
     let mut line = String::new();
@@ -679,8 +702,11 @@ fn serve(
         Err(e) => json!({"ok": false, "error": e}),
     };
     // Even if this client disappears, an accepted shutdown must release the listener.
-    let _ = serde_json::to_writer(&mut stream, &body)
-        .and_then(|_| stream.write_all(b"\n").map_err(serde_json::Error::io));
+    // JSON emits many small writes; buffer them before writing to the socket.
+    let mut writer = BufWriter::new(&mut stream);
+    let _ = serde_json::to_writer(&mut writer, &body)
+        .and_then(|_| writer.write_all(b"\n").map_err(serde_json::Error::io))
+        .and_then(|_| writer.flush().map_err(serde_json::Error::io));
     Ok(shutdown)
 }
 
@@ -725,7 +751,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     deadline = Instant::now() + Duration::from_millis(10);
                 } else {
                     let rate = state.profile.as_ref().unwrap().actual_rate;
-                    deadline += Duration::from_secs_f64((rate * 0.05).round() / rate);
+                    deadline += Duration::from_secs_f64(
+                        (rate * SIMULATION_BLOCK_SECONDS).round().max(1.0) / rate,
+                    );
                 }
             }
         }
@@ -850,6 +878,21 @@ mod tests {
     }
 
     #[test]
+    fn display_window_can_include_twenty_seconds_of_original_samples() {
+        let mut state = State::new();
+        state.command(Command::Start {
+            profile: Box::new(profile()),
+            recording_path: None,
+        }).unwrap();
+        let values: Vec<f64> = (0..80000).map(|i| i as f64 / 10000.0).collect();
+        state.accept_values(values.clone()).unwrap();
+        let window = state.poll(20.0, None);
+        assert_eq!(window["snapshot_start"], 0);
+        assert_eq!(window["total_scans"], 40000);
+        assert_eq!(window["raw"], json!(values));
+    }
+
+    #[test]
     fn direct_duration_recording_crops_disk_and_keeps_preview_running() {
         let path = recording_path("direct");
         let mut p = profile();
@@ -874,7 +917,7 @@ mod tests {
         assert_eq!(state.recorded_scans, 6);
         assert_eq!(state.recording_remaining_scans, Some(0));
         assert_eq!(state.termination_reason, "duration_complete");
-        assert_eq!(state.poll(1.0)["raw"], json!(values));
+        assert_eq!(state.poll(1.0, None)["raw"], json!(values));
         let bytes = fs::read(path.join("raw.f64")).unwrap();
         let expected: Vec<_> = values[..12].iter().flat_map(|v| v.to_le_bytes()).collect();
         assert_eq!(bytes, expected);

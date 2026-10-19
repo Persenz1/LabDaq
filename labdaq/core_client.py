@@ -86,6 +86,9 @@ class RemoteEngine:
         self._state = state
         self._times = np.empty(0)
         self._raw = np.empty((0, len(state["profile"]["config"]["channels"])))
+        self._snapshot_end = None
+        self.display_seconds = 8.0
+        self.display_revision = 0
         self.connection_error = ""
         self._lock = threading.Lock()
         self._request_lock = threading.Lock()
@@ -126,17 +129,34 @@ class RemoteEngine:
                 self.connection_error = ""
                 if op == "poll":
                     width = len(state["profile"]["config"]["channels"])
-                    self._raw = np.asarray(state["raw"], dtype=np.float64).reshape(-1, width)
-                    self._times = (state["snapshot_start"] + np.arange(len(self._raw))) / self.sample_rate
+                    incoming = np.asarray(state["raw"], dtype=np.float64).reshape(-1, width)
+                    if state["snapshot_start"] == self._snapshot_end:
+                        if len(incoming):
+                            limit = min(state["capacity"], max(1, round(fields["seconds"] * self.sample_rate)))
+                            self._raw = np.concatenate((self._raw, incoming))[-limit:]
+                    else:
+                        self._raw = incoming
+                    if len(incoming) or state["snapshot_start"] != self._snapshot_end:
+                        self._times = (state["total_scans"] - len(self._raw)
+                                       + np.arange(len(self._raw))) / self.sample_rate
+                        self.display_revision += 1
+                    self._snapshot_end = state["total_scans"]
             return state
 
     def _poll(self):
+        previous_seconds = None
         while not self._closed.is_set():
+            started = time.monotonic()
             try:
-                self._call("poll", seconds=8)
+                seconds = self.display_seconds
+                self._call("poll", seconds=seconds,
+                           after_scan=self._snapshot_end if seconds == previous_seconds else None)
+                previous_seconds = seconds
             except (OSError, ValueError, RuntimeError) as exc:
                 self.connection_error = f"核心连接中断，采集状态未知：{exc}"
-            self._closed.wait(.1 if not self.connection_error else 1)
+            interval = 1 / 30 if self.running else .1
+            self._closed.wait(max(0, interval - (time.monotonic() - started))
+                              if not self.connection_error else 1)
 
     @property
     def source(self):

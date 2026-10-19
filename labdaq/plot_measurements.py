@@ -7,6 +7,8 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtWidgets as W
 
+from . import theme
+
 
 class PlotMeasurements(W.QWidget):
     """Two movable cursors whose readings always come from real samples.
@@ -18,30 +20,38 @@ class PlotMeasurements(W.QWidget):
 
     def __init__(self, plot: pg.PlotWidget, parent: W.QWidget | None = None):
         super().__init__(parent)
+        self.setObjectName("transparentHost")
+        p = theme.current()
         self.plot = plot
         self.enabled_checkbox = W.QCheckBox("测量游标")
         self.channel_combo = W.QComboBox()
         self.channel_combo.setMinimumContentsLength(12)
         self.channel_combo.setEnabled(False)
         self.readout = W.QLabel()
+        self.readout.setObjectName("notice")
+        self.readout.setProperty("tone", "info")
         self.readout.setTextFormat(QtCore.Qt.TextFormat.PlainText)
         self.readout.setWordWrap(True)
+        self.readout.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
         self.readout.setToolTip("A、B 的时间与幅值取最近真实样本；间隔倒数仅为 1/|Δt|，不代表信号基频。")
         self.readout.hide()
         layout = W.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
         controls = W.QHBoxLayout()
+        controls.setSpacing(8)
         controls.addWidget(self.enabled_checkbox)
         controls.addWidget(self.channel_combo)
         controls.addStretch()
         layout.addLayout(controls)
         layout.addWidget(self.readout)
+        cursor_colors = (p.channels[2 % len(p.channels)], p.channels[3 % len(p.channels)])
         self.cursor_lines = tuple(
             pg.InfiniteLine(angle=90, movable=True, label=name,
                             pen=pg.mkPen(color, width=1.5),
                             hoverPen=pg.mkPen(color, width=2.5),
                             labelOpts={"position": .96, "color": color})
-            for name, color in (("A", "#CA7B1A"), ("B", "#7954BE"))
+            for name, color in zip(("A", "B"), cursor_colors)
         )
         for line in self.cursor_lines:
             line.setZValue(30)

@@ -5,10 +5,14 @@ from datetime import datetime, timezone
 import math
 from pathlib import Path
 
-from PySide6 import QtCore, QtWidgets as W
+from PySide6 import QtCore, QtGui, QtWidgets as W
 
+from . import theme, ui_kit
 from .recording import load_session
 from .data_dialog import BatchExportDialog
+
+
+DIALOG_MARGINS = (22, 20, 22, 20)
 
 
 @dataclass
@@ -93,27 +97,93 @@ class _SortItem(W.QTableWidgetItem):
         return self.sort_value < other.sort_value
 
 
+def _dialog_layout(dialog: W.QDialog, spacing: int = 13) -> W.QVBoxLayout:
+    layout = W.QVBoxLayout(dialog)
+    layout.setContentsMargins(*DIALOG_MARGINS)
+    layout.setSpacing(spacing)
+    return layout
+
+
+def _header(title: str, subtitle: str, icon_name: str | None = None) -> W.QWidget:
+    p = theme.current()
+    holder = W.QWidget()
+    holder.setObjectName("transparentHost")
+    row = W.QHBoxLayout(holder)
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(12)
+    if icon_name:
+        mark = W.QLabel()
+        mark.setFixedSize(40, 40)
+        mark.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        mark.setPixmap(theme.icon(icon_name, p.accent, 20).pixmap(20, 20))
+        mark.setStyleSheet(
+            f"background: {p.accent_soft}; border: 1px solid {p.border};"
+            f" border-radius: {p.radius_small}px;")
+        row.addWidget(mark)
+    texts = W.QVBoxLayout()
+    texts.setContentsMargins(0, 0, 0, 0)
+    texts.setSpacing(2)
+    texts.addWidget(ui_kit.label(title, "pageTitle"))
+    texts.addWidget(ui_kit.label(subtitle, "pageSubtitle", True))
+    row.addLayout(texts, 1)
+    return holder
+
+
+def _magnifier_icon(color: str, size: int = 14) -> QtGui.QIcon:
+    """Small search glyph, since the shared icon set has no magnifier entry."""
+    pixmap = QtGui.QPixmap(size * 2, size * 2)
+    pixmap.fill(QtCore.Qt.GlobalColor.transparent)
+    pixmap.setDevicePixelRatio(2.0)
+    painter = QtGui.QPainter(pixmap)
+    painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+    pen = QtGui.QPen(QtGui.QColor(color))
+    pen.setWidthF(1.7)
+    pen.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
+    painter.setPen(pen)
+    painter.scale(size / 24.0, size / 24.0)
+    painter.drawEllipse(QtCore.QPointF(10.5, 10.5), 6.2, 6.2)
+    painter.drawLine(QtCore.QPointF(15.2, 15.2), QtCore.QPointF(20.4, 20.4))
+    painter.end()
+    return QtGui.QIcon(pixmap)
+
+
 class RecordingLibraryDialog(W.QDialog):
     """Read-only local session picker; selected_path is set only on acceptance."""
 
     def __init__(self, recording_root, parent=None):
         super().__init__(parent)
+        p = theme.current()
         self.recording_root = Path(recording_root)
         self.selected_path: Path | None = None
         self.entries = []
         self.setWindowTitle("记录库")
-        self.resize(1120, 560)
-        layout = W.QVBoxLayout(self)
-        root_label = W.QLabel(f"记录目录：{self.recording_root}")
-        root_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(root_label)
-        toolbar = W.QHBoxLayout()
+        self.resize(1120, 620)
+        self.setMinimumSize(820, 520)
+        layout = _dialog_layout(self)
+
+        layout.addWidget(_header("记录库", f"记录目录：{self.recording_root}", "library"))
+
+        search_row = W.QHBoxLayout()
+        search_row.setSpacing(8)
         self.search = W.QLineEdit()
         self.search.setPlaceholderText("搜索实验名、备注、目录名或结束状态")
+        self.search.setClearButtonEnabled(False)
+        self.search.addAction(_magnifier_icon(p.text_faint, 14),
+                              W.QLineEdit.ActionPosition.LeadingPosition)
+        self._clear_action = self.search.addAction(
+            theme.icon("error", p.text_faint, 13),
+            W.QLineEdit.ActionPosition.TrailingPosition)
+        self._clear_action.setToolTip("清除搜索")
+        self._clear_action.triggered.connect(lambda: self.search.clear())
+        self._clear_action.setVisible(False)
+        self.search.textChanged.connect(self._sync_clear_action)
         self.refresh_button = W.QPushButton("刷新")
-        toolbar.addWidget(self.search, 1)
-        toolbar.addWidget(self.refresh_button)
-        layout.addLayout(toolbar)
+        self.refresh_button.setIcon(theme.icon("refresh", p.text_muted, 15))
+        self.refresh_button.setIconSize(QtCore.QSize(15, 15))
+        search_row.addWidget(self.search, 1)
+        search_row.addWidget(self.refresh_button)
+        layout.addLayout(search_row)
+
         self.table = W.QTableWidget(0, 8)
         self.table.setHorizontalHeaderLabels(
             ["开始时间（本地）", "实验名", "组号", "时长（秒）", "通道数", "结束状态", "备注", "目录名"])
@@ -121,22 +191,49 @@ class RecordingLibraryDialog(W.QDialog):
         self.table.setSelectionBehavior(W.QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(W.QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table.setWordWrap(False)
+        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(False)
         self.table.verticalHeader().hide()
+        self.table.verticalHeader().setDefaultSectionSize(31)
         self.table.horizontalHeader().setSectionResizeMode(W.QHeaderView.ResizeMode.Interactive)
         self.table.horizontalHeader().setSectionResizeMode(6, W.QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setHighlightSections(False)
         for column, width in enumerate((155, 130, 55, 90, 65, 135, 220, 210)):
             self.table.setColumnWidth(column, width)
         layout.addWidget(self.table, 1)
-        self.detail = W.QLabel()
-        self.detail.setWordWrap(True)
+
+        detail_card, detail_layout = ui_kit.card(margins=(16, 11, 16, 12), spacing=7)
+        detail_head = W.QHBoxLayout()
+        detail_head.setSpacing(7)
+        self.detail_dot = ui_kit.status_dot(p.text_faint, 8)
+        detail_head.addWidget(self.detail_dot)
+        detail_head.addWidget(ui_kit.field_label("记录详情"))
+        detail_head.addStretch()
+        detail_layout.addLayout(detail_head)
+        self.detail = ui_kit.label("", "muted", True)
         self.detail.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(self.detail)
-        buttons = W.QDialogButtonBox(W.QDialogButtonBox.StandardButton.Cancel)
-        self.batch_export_button = buttons.addButton("批量导出", W.QDialogButtonBox.ButtonRole.ActionRole)
-        self.open_button = buttons.addButton("打开", W.QDialogButtonBox.ButtonRole.AcceptRole)
-        buttons.button(W.QDialogButtonBox.StandardButton.Cancel).setText("取消")
-        layout.addWidget(buttons)
-        buttons.rejected.connect(self.reject)
+        self.detail.setMinimumHeight(38)
+        detail_layout.addWidget(self.detail)
+        layout.addWidget(detail_card)
+
+        layout.addWidget(theme.divider())
+        footer = W.QHBoxLayout()
+        footer.setSpacing(8)
+        self.batch_export_button = W.QPushButton("批量导出")
+        self.batch_export_button.setIcon(theme.icon("export", p.text_muted, 15))
+        self.batch_export_button.setIconSize(QtCore.QSize(15, 15))
+        footer.addWidget(self.batch_export_button)
+        footer.addStretch(1)
+        cancel_button = W.QPushButton("取消")
+        cancel_button.setObjectName("ghost")
+        footer.addWidget(cancel_button)
+        self.open_button = W.QPushButton("打开")
+        self.open_button.setObjectName("primary")
+        self.open_button.setIcon(theme.icon("open", p.accent_text, 15))
+        self.open_button.setIconSize(QtCore.QSize(15, 15))
+        footer.addWidget(self.open_button)
+        layout.addLayout(footer)
+        cancel_button.clicked.connect(self.reject)
         self.open_button.clicked.connect(self._open_selected)
         self.batch_export_button.clicked.connect(self._batch_export)
         self.table.itemSelectionChanged.connect(self._update_selection)
@@ -145,6 +242,9 @@ class RecordingLibraryDialog(W.QDialog):
         self.search.textChanged.connect(self._filter_rows)
         self.refresh_button.clicked.connect(self.refresh)
         self.refresh()
+
+    def _sync_clear_action(self, text):
+        self._clear_action.setVisible(bool(text.strip()))
 
     def refresh(self):
         self.entries = list_recordings(self.recording_root)
@@ -166,6 +266,9 @@ class RecordingLibraryDialog(W.QDialog):
                 item = _SortItem(value, key)
                 item.setData(QtCore.Qt.ItemDataRole.UserRole, entry)
                 item.setToolTip(entry.error or value)
+                if column in (2, 3, 4):
+                    item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight |
+                                          QtCore.Qt.AlignmentFlag.AlignVCenter)
                 self.table.setItem(row, column, item)
         self.table.setSortingEnabled(True)
         self.table.sortItems(0, QtCore.Qt.SortOrder.DescendingOrder)
@@ -197,6 +300,7 @@ class RecordingLibraryDialog(W.QDialog):
         self._update_selection()
 
     def _update_selection(self, *_):
+        p = theme.current()
         entry = self._selected_entry()
         selected = self._selected_entries()
         self.open_button.setEnabled(entry is not None and entry.error is None)
@@ -204,12 +308,22 @@ class RecordingLibraryDialog(W.QDialog):
         self.batch_export_button.setEnabled(can_export)
         self.batch_export_button.setToolTip("导出全部选中记录组的全部样本和通道" if can_export else
                                             "请使用 Ctrl/Shift 选择可读且已收尾的记录组")
+        incomplete = [item for item in selected if item.error is None and not item.finalized]
         detail = f"{entry.path}\n{entry.error or entry.status}" if entry else getattr(self, "_count_text", "")
         if len(selected) > 1:
             detail += f"\n已选择 {len(selected)} 组；打开仅打开当前组，批量导出处理全部选中组。"
-        if any(item.error is None and not item.finalized for item in selected):
+        if incomplete:
             detail += "\n选中记录尚未收尾，不能批量导出；活动记录请先结束，异常中断记录可单独打开后导出。"
         self.detail.setText(detail)
+        if entry is not None and entry.error:
+            dot = p.danger
+        elif incomplete:
+            dot = p.warning
+        elif entry is not None:
+            dot = p.success
+        else:
+            dot = p.text_faint
+        self.detail_dot.setPixmap(theme.dot_pixmap(dot, 8))
 
     def _open_selected(self):
         entry = self._selected_entry()

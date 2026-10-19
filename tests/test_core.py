@@ -152,6 +152,61 @@ def test_high_rate_ring_is_bounded_and_record_keeps_every_scan(core, tmp_path):
                                np.asarray(state["raw"]).reshape(-1, 4), atol=0, rtol=0)
 
 
+def test_incremental_preview_keeps_exact_samples_through_ring_rollover(core):
+    p = profile(rate=105469, selected=(0, 2, 3))
+    state = core.request("start", profile=p)
+    engine = RemoteEngine(core, state)
+    try:
+        until(lambda: engine.total_scans >= 240000)
+        engine.stop()
+        until(lambda: engine._snapshot_end == engine.total_scans)
+        full = core.request("poll", seconds=8)
+        times, raw = engine.snapshot()
+        assert raw.shape == (200000, 3)
+        np.testing.assert_array_equal(raw, np.asarray(full["raw"]).reshape(-1, 3))
+        np.testing.assert_allclose(times, np.arange(full["snapshot_start"], full["total_scans"]) / engine.sample_rate,
+                                   rtol=0, atol=0)
+        # A stopped buffer sends no repeated samples, while the GUI keeps its cache.
+        unchanged = core.request("poll", seconds=8, after_scan=full["total_scans"])
+        assert unchanged["raw"] == []
+        np.testing.assert_array_equal(engine.snapshot()[1], raw)
+        start = full["total_scans"] - 37
+        delta = core.request("poll", seconds=8, after_scan=start)
+        assert delta["snapshot_start"] == start
+        np.testing.assert_array_equal(np.asarray(delta["raw"]).reshape(-1, 3), raw[-37:])
+        # Missed history is bounded by the requested window; a reset cursor gets a full window.
+        bounded = core.request("poll", seconds=.01, after_scan=0)
+        count = round(.01 * engine.sample_rate)
+        assert bounded["snapshot_start"] == full["total_scans"] - count
+        np.testing.assert_array_equal(np.asarray(bounded["raw"]).reshape(-1, 3), raw[-count:])
+        reset = core.request("poll", seconds=8, after_scan=full["total_scans"] + 1)
+        np.testing.assert_array_equal(np.asarray(reset["raw"]).reshape(-1, 3), raw)
+    finally:
+        engine.detach()
+
+
+def test_stopped_display_window_can_expand_and_shrink_without_new_samples(core):
+    state = core.request("start", profile=profile(rate=1000))
+    engine = RemoteEngine(core, state)
+    engine.display_seconds = .1
+    try:
+        until(lambda: engine.total_scans >= 700)
+        engine.stop()
+        until(lambda: engine._snapshot_end == engine.total_scans)
+        count = engine.total_scans
+        revision = engine.display_revision
+        engine.display_seconds = .5
+        until(lambda: len(engine.snapshot()[0]) == round(.5 * engine.sample_rate))
+        assert engine.total_scans == count and engine.display_revision > revision
+        full = np.asarray(core.request("poll", seconds=.5)["raw"]).reshape(-1, 4)
+        np.testing.assert_array_equal(engine.snapshot()[1], full)
+        engine.display_seconds = .2
+        until(lambda: len(engine.snapshot()[0]) == round(.2 * engine.sample_rate))
+        np.testing.assert_array_equal(engine.snapshot()[1], full[-round(.2 * engine.sample_rate):])
+    finally:
+        engine.detach()
+
+
 @pytest.mark.parametrize("during_preview", [False, True])
 def test_fixed_duration_exact_frames_and_next_group(core, tmp_path, during_preview):
     p = profile(selected=(0, 3))
@@ -287,7 +342,8 @@ app.exec()
         configure_application(app)
         window = MainWindow(core_endpoint=endpoint)
         assert window.engine.recording == (duration is None) and window.latest_recording == path
-        assert window.recording_duration_seconds == duration and window.recording_notes == "退出后自动结束"
+        assert window.recording_duration_seconds == duration
+        assert "notes" not in window._recording_options()
         assert window.active_channels == (0, 2, 3)
         assert window.channels[2].name == "重连通道" and window.channels[2].zero_volts == .123
         assert window.channels[2].inverted and window.experiment.text() == "GUI崩溃续录"
@@ -385,14 +441,14 @@ def test_usb_profile_load_is_offline_and_preserves_physical_channel(tmp_path, mo
     try:
         window.scenario.setCurrentIndex(window.scenario.findData("usb"))
         window.active_channels = (3,)
-        window.rate.setValue(1000)
+        window.rate.setCurrentIndex(window.rate.findData(1000.0))
         path = tmp_path / "usb.json"
         window.save_profile_to(path)
         window.scenario.setCurrentIndex(window.scenario.findData("rust"))
         window.load_profile_from(path)
         assert window.scenario.currentData() == "usb" and window.active_channels == (3,)
         assert window.engine is None and not window.input_button.isVisible()
-        assert "真实 USB" in window.mode_badge.text()
+        assert "DT9837C" in window.mode_badge.text() and "未连接" in window.mode_badge.text()
     finally:
         window.close()
         window.deleteLater()

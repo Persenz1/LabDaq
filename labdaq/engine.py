@@ -21,7 +21,7 @@ from .transport import DaqSession, TransportError
 
 class AcquisitionEngine:
     def __init__(self, config: AcquisitionConfig, channels: list[ChannelSettings],
-                 scenario: str = "drag", block_seconds: float = 0.05, *,
+                 scenario: str = "drag", block_seconds: float = 1 / 60, *,
                  signal_settings=None, input_session=None):
         self.config = config
         self.channels = [replace(c) for c in channels]
@@ -34,7 +34,7 @@ class AcquisitionEngine:
                                {"scenario": scenario, "seed": self.transport.seed,
                                 "signal_settings": asdict(signal_settings) if signal_settings else None})
         self.block_size = max(1, round(self.sample_rate * block_seconds))
-        self.capacity = min(200_000, max(self.block_size, round(self.sample_rate * 12)))
+        self.capacity = min(200_000, max(self.block_size, round(self.sample_rate * 60)))
         self._ring = np.empty((self.capacity, len(config.channels)), dtype=np.float64)
         self._position = 0
         self.total_scans = 0

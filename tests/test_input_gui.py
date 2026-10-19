@@ -27,7 +27,7 @@ def test_hpf_selected_in_gui_records_all_samples_and_restores_profile(tmp_path):
     configure_application(app)
     path = tmp_path / "force.hpf"
     expected = _force_hpf(path)
-    window = MainWindow()
+    window = MainWindow(core_endpoint=tmp_path / "unused.json")
     window.recording_root = tmp_path
     try:
         window.load_input_hpf(path)
@@ -68,7 +68,7 @@ def test_custom_signal_editor_and_profile_keep_channel_parameters(tmp_path):
     dialog = SignalDialog(settings)
     dialog.apply()
     assert dialog.settings == settings
-    window = MainWindow()
+    window = MainWindow(core_endpoint=tmp_path / "unused.json")
     try:
         window.scenario.setCurrentIndex(window.scenario.findData("custom"))
         window.signal_settings = dialog.settings

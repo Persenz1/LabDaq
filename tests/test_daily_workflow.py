@@ -134,6 +134,8 @@ def test_rust_simulated_preview_zero_can_be_undone_and_recorded(tmp_path):
         window.zero_channels()
         assert window.undo_zero_button.isEnabled()
         assert window.channels[0].zero_volts == pytest.approx(.4, abs=20 / 2**24)
+        window.stop_acquisition()
+        assert not window.engine.running and window.undo_zero_button.isEnabled()
         window.undo_zero_button.click()
         assert window.channels[0].zero_volts == .123 and not window.undo_zero_button.isEnabled()
         assert client.request("poll")["profile"]["channels"][0]["zero_volts"] == .123
