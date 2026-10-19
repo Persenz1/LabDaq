@@ -1,10 +1,12 @@
 # QuickDAQ 功能基线与 LabDAQ 对照
 
-更新：2026-10-13。目标是保留 QuickDAQ 在本实验室 DT9837C 上适用的能力，常用流程简化，高级功能保留入口。下表按能力归纳，不要求复制原版界面或使用原厂 SDK。
+更新：2026-10-17（新增本机界面核对；LabDAQ 实现状态仍沿用 2026-10-13 基线）。目标是保留 QuickDAQ 在本实验室 DT9837C 上适用的能力，常用流程简化，高级功能保留入口。下表按能力归纳，不要求复制原版界面或使用原厂 SDK。
 
 **当前 LabDAQ 输入是协议电压模拟或 HPF 离线回放，尚无真实 USB 连续采集后端。** 新增九种可配置波形、HPF 单次/循环输入及来源记录；本轮只增加必要的输入操作，没有重新设计前端。表中的“部分”表示仅完成列出的部分，不代表与原版行为等价。ManuWare/电荷放大器配置不属于 DAQ 软件范围。
 
 来源缩写：**Q** 为 [QuickDAQ 手册 UM-25242-H](https://files.digilent.com/manuals/UMQuickDAQ.pdf)，**H** 为 [DT9837 系列手册 UM-22417-AK](https://files.digilent.com/manuals/UM9837.pdf)，页码均为手册印刷页码；**R** 为 [QuickDAQ 发布说明](https://files.digilent.com/downloads/DTSoftware/QuickDAQ/ReleaseNotes.txt)的本地归档 3.7.0.49 版本。Base、FFT、Advanced FFT 是手册的功能分档，后者包含前者；这里不依据旧手册判断当前授权政策。
+
+**本机核对结论（2026-10-17）**：此前已记录主要能力族，但还不是逐界面核对后的完整清单。本次通过 Computer Use 检查了本机 QuickDAQ **3.7.0.49** 的 Data Logger / FFT Analyzer、通道配置、数字滤波、输出、显示与统计等界面。About 和 License Info 均显示 **FFT Analysis Option**，不是 Advanced FFT；本机出现单通道 FFT 新增入口，未出现双通道函数新增入口。因此，下表 FRF、互谱、相干、冲击专用窗、Nyquist、UFF 等 Advanced 能力仍保留手册依据，不标为本机已验证。界面核对细节见文末。
 
 ## 采集、配置与记录
 
@@ -15,7 +17,7 @@
 | 耦合与 IEPE | Base：逐通道 AC/DC、恒流源开关 | C 为 **2 mA**；AC 高通名义 1 Hz。不能照抄 Q 通用说明中的 4 mA | **已有配置与协议模拟**；HPF 输入从文件恢复并锁定。此前独立 SDK 单点诊断不代表本程序已有实机后端；5073A 电压输出沿用已确认的 DC、IEPE 关闭设置 | Q 100；H 69、118 |
 | 预览/记录/暂停/停止 | Base：View 不落盘，Record 落盘；Pause 暂停记录，Stop 停止接收 | 适用 | **部分（离线输入）**：预览、开始/结束记录、停止；“暂停滚动”仅冻结显示，**不等同于原版暂停记录** | Q 46 |
 | 连续与定长记录 | Base：连续或指定天/时/分/秒；文件名固定、序号或日期时间；记录备注、时长与采样计数。FFT：按记录块/平均次数自动结束 | C 支持连续扫描；定长、分块和文件命名属于应用控制 | **部分（离线）**：连续写盘、时间戳文件夹、采样计数及结束原因；HPF 默认单次到 EOF，循环可选，直接开始记录保留首块及源样本偏移；缺任意定长、平均次数结束、序号命名、备注和剩余空间显示 | Q 121–127；H 71–72 |
-| 启动触发 | Base：软件、外部 TTL、模拟阈值，实际选项随硬件 | C：软件、外部 TTL **上升沿**；任一选中 AI 的正/负阈值。不可套用其他设备的 TTL 下降沿、LXI/LAN 触发 | **部分**：只有模拟软件启动；未实现实机触发、阈值及等待状态 | Q 128、134–135；H 73、99、125 |
+| 启动触发 | Base：软件、外部 TTL、模拟阈值，实际选项随硬件 | H 确认 C 的软件、外部 TTL **上升沿**、任一选中 AI 的正/负阈值。本机 Data Logger 下拉框却同时列出 TTL Pos/Neg Edge，FFT 列表仅有 Pos Edge；**下降沿只确认界面选项，硬件行为未验证**，不能据此扩大 C 的能力范围 | **部分**：只有模拟软件启动；未实现实机触发、阈值及等待状态 | Q 128、134–135；H 73、99、125；2026-10-17 本机 UI |
 | 重复/冲击记录 | FFT：Free Run、Software Triggered、Auto Retrigger/延迟、User Accept-Reject；阈值记录的预触发比例与触发标记 | C 可做阈值前后采集；原厂 Windows 有 start/reference trigger，Linux 接口不直接提供 reference trigger。应用重触发不等于硬件无间隙逐触发扫描 | **未实现**：重复记录、接受/拒绝、预触发缓存与标记；现有模拟分块读取不能替代此流程 | Q 125–126、133–136；H 72–74、94 |
 | 原始记录与回放 | Base：HPF 写入/无设备读取、长记录浏览；可修改文件内名称、单位、灵敏度和偏移后重处理 | 适用，但 HPF 中存储值与传感器缩放需按文件解释 | **部分**：自有原始 V 流式记录；原有 Double/V 子集及已核实 DT9837C 力 HPF 可读。显式 `waveform_only` 从原始块读 V、从完整配置取精确灵敏度/物理通道/采样率；辅助块元数据保留，未知事件拒绝；无通用 HPF 支持、HPF 写出及回放换算编辑 | Q 20、36–37、86；R：HPF/滤波修复 |
 | 多设备与同步 | Base：多设备选择；R 增加 device collection；FFT 以主设备触发 | C 有 RJ45/LVDS 主从同步；建议 C 只与 C 组网，直连两台或经分配板最多四台；从机先启动，主机后启动；不得把“多 USB 设备”当作已同步 | **未实现**：多设备配置、身份关联、主从时钟、跨设备记录。当前 GUI 最多四路 | Q 27–30、134、142；R：3.7.0.32 后变更；H 87–89、153 |
@@ -44,7 +46,7 @@
 | 互谱与相干 | Advanced：Cross Spectrum、Cross PSD、Coherence、Coherent Output Power；两侧可分别积分 | 适用 | **部分**：幅值平方相干随 H1 显示；互谱只作内部计算，无独立图/输出；无 COP 或积分 | Q 220–226 |
 | 谱峰与动态性能 | FFT：最多 10 个谱峰、幅值/峰高优先、灵敏度；IBF、THD、SFDR、SINAD、SNR、ENOB，含 RMS/Vector 平均选项 | 软件分析适用；仪器性能指标需匹配输入及量程，不能从任意力曲线解释为 ADC 精度 | **未实现**；实时近一秒峰值不是频谱峰检测 | Q 227–228、238–246 |
 | 数字滤波 | FFT/Advanced：逐通道 Bessel/Butterworth/Chebyshev；低/高/带通/带阻，1–10 阶、截止频率/纹波；频率/冲激/阶跃响应与稳定性显示 | 适用；不替代 C 的采样前抗混叠，也不等于外置 5073A 的 200 Hz 低通 | **部分**：窗口零相位 Butterworth 低通；另有未接入界面的 StreamingFilter。缺完整滤波配置与响应图；原始记录保持不变，现行为不同于 R 所述“滤后数据写 HPF” | Q 164–168；R：3.6.1.1 后变更；H 68、118 |
-| 采集页移动平均 | Base 通用采集设置：硬件支持时可选 16 点移动平均/None | **C 上是否提供该选项待对照实际 QuickDAQ**；Q 明示设备相关，不把它当作 C 固定功能 | **未实现该设置**；不能与上面的软件 IIR 混为一项 | Q 128、132 |
+| 采集页移动平均 | Base 通用采集设置：硬件支持时可选 16 点移动平均/None | 本机 3.7.0.49 + DT9837C 的 Data Logger / Acquisition、FFT / Freq 页面**均未显示该设置**；不列作本机已确认能力，也不推断其他版本或设备没有 | **未实现该设置**；不能与上面的软件 IIR 混为一项 | Q 128、132；2026-10-17 本机 UI |
 | 倍频程/阶次 | 所读手册与 R **未找到倍频程带分析、1/3 倍频程或阶次跟踪功能依据**；octave 只用于对数扫频速率、粉红噪声说明 | 倍频程可作为后续软件扩展；C 没有原生转速计输入，阶次跟踪需要另定转速来源 | **未实现，列为待确认扩展**，不写成已确认的原版缺失功能 | Q 147、157、336；H 82、95 |
 
 ## 信号输出与硬件边界
@@ -63,4 +65,63 @@
 2. **已核实力 HPF 的输入链已打通，通用格式兼容仍有限。** `read()` 返回 0x3000 原始 V；力换算采用 0x7000 完整配置中的 `MilliVoltsPerUnit`，不以略低精度的 `SensorScale` 代替。0x8000/0x9000/0xA000 只保留辅助元数据，不解作波形；回放记录标为 `file_replay`。约 20 秒、20,002 × 3 样本已完成引擎记录回读，V 与工程量逐值相等。后续只用原始 HPF、历史第 1/2 次，不再读 CSV；其他单位、事件/触发扩展仍需分别支持。
 3. **手册与 3.7 发布说明有差别。** Q 179/201 仍列“采集时禁绘图”，R 说明已移除该按钮；不把旧按钮列为必需保留。R 还记录 CSV 末值被置零、绝对时间、UFF 复数/方向/单位、首次触发拒绝后记录及大 HPF 修复，说明这些结果语义需要保留，不能只做相似菜单。
 
-LabDAQ 对照入口：[gui.py](../../labdaq/gui.py)、[engine.py](../../labdaq/engine.py)、[inputs.py](../../labdaq/inputs.py)、[signals.py](../../labdaq/signals.py)、[transport.py](../../labdaq/transport.py)、[processing.py](../../labdaq/processing.py)、[recording.py](../../labdaq/recording.py)、[hpf.py](../../labdaq/hpf.py)。本表基于当前代码与本地手册阅读，不表示未实现能力已做实机验证。
+## 2026-10-17 本机界面核对
+
+本节记录实际打开的页面和展开的选项，补充上面的能力表。**看到设置入口不等于完成采集、算法或输出验证。** 本次没有启动 View / Record / AO，没有改动通道量程、耦合、恒流源或灵敏度，没有应用数字滤波。
+
+### 顶层入口
+
+| 菜单 | 本机入口 |
+|---|---|
+| File | New / Open / Close Hpf Data File；Export Data；Save Current Plot Image；Open Current Data In Excel；Load / Save Configuration（XML）；打开 HPF / 导出目录；Page Setup、Print Preview、Print；Exit、Exit without saving current configuration |
+| Edit | Copy plot data / image to clipboard |
+| Record | View、Record、Pause（Space）、Stop；未运行时 Pause / Stop 灰显 |
+| Plot | Plot Area Mouse Mode：Select / Zoom / Cursor；Axis Mouse Mode：Scroll / Zoom |
+| Configuration | Input Channel Configuration、Digital Filter Configuration、Device Selection |
+| Windows | Acquisition Config、Plot and Data Config、Channel Plot、Channel Display、Channel Statistics；恢复上次保存布局或默认布局 |
+| Mode / Help | Data Logger / FFT Analyzer；User Manual、License Information、About；工具栏另有 Style 外观入口 |
+
+### 设备、输入、记录与输出
+
+| 页面 | 本次确认的细节 |
+|---|---|
+| Device Selection | Device Family 当前为 OpenLayersDevices；Available / Selected Devices；Add、Remove、Refresh；Model、Device-ID、Driver Version；选中设备表含 Name、Board ID、Device-ID、Master。刷新读到 DT9837-C、驱动 **7.0.0.9**；无选中设备时提示只能进入 File Reader Mode |
+| Input Channel Configuration | 四路 Ain 0–3；Enable、Channel Name、Range（**−10–10 V / −1–1 V**）、Coupling、Current Source、Engineering Unit、mV/EU、EU Offset、Point #、Comment、Dir。Actions 可批量启用/禁用全部或选中通道、批量设置全部或选中电压通道的单位 |
+| 进入时的实验配置 | Ain 0–2 启用，Ain 3 禁用；四路均 DC、Current Source 未勾选、±10 V。前三路单位 N、方向 X+ / Y+ / Z+；灵敏度显示 500、500、333.33… mV/EU，第三路在表格中被截断，未把显示精度当作完整参数 |
+| Data Logger / Recording | 文件名生成方式、Start #、基础文件名/路径、剩余磁盘空间、连续采集、定长 dd.hh:mm:ss、独立 X Axis Span、Notes。原配置为 20 秒，实际采样率状态显示 **1000.116 Hz**，间隔 **0.000999884 s**；采样频率输入框显示 1000.12，存在显示精度差别 |
+| Data Logger / Acquisition | 每通道采样频率范围标为 **195.3–105469 Hz**；Software、External TTL Pos Edge、External TTL Neg Edge、Analog Threshold Pos/Neg Edge。阈值页含通道、工程单位阈值及对应 V（原配置 1 N 对应 0.5 V）。SingleEnded 和全局 Input Voltage Range 灰显，量程应从逐通道页设置 |
+| Output | 一路输出，Enable 原为关闭。Waveform 可切换 Fixed / Sweep / Noise；表头含 Channel Name、Peak Voltage、Offset。Fixed 页可见 Signal Type、Frequency、Output Mode、Repeat burst、Burst On/Off Time；Sweep 页可见 Sweep Mode、Freq Change、起止频率、Sweep On/Off Time；Noise 页可见 Noise Type、Repeat Method、起止频率和 Lock to analysis frequency。共有 Ramp Up/Down、Lock to acquisition time、Start/Stop Method、Trigger Source、扬声器图标和 Start。输出未启用，因此未展开灰显的子选项，具体可选波形仍以上表手册记录为依据 |
+
+### 显示、FFT 与数字滤波
+
+| 页面 | 本次确认的细节 |
+|---|---|
+| Plot and Data Config | 每通道分别控制 Plot / Display / Statistics 可见性、Show Cursor、Plot Column、Signal Group、Color；Actions 对选中通道批量操作；Hide/show columns 只控制配置表列的显隐 |
+| Channel Plot / Control、Style | 刷新率、Smooth scrolling、样本号/相对/绝对时间、12/24 小时、Display Day、图高；背景/坐标轴/网格颜色、线宽、标题文字与可见性、标题及轴标签字体/颜色。工具栏含轴/游标联动、缩放/平移、图例、数据点标记、复制、图像保存、打印相关入口 |
+| Channel Display | Hide Unused Channels、小数位精度、列数、刷新速度；Data Reduction Method 为 First Val / Average / Min / Max |
+| Stats | Data Logger 可见 Show Min/Max/Mean Stats；FFT 新增 Show FFT Peaks、1–10 个峰、绝对幅值或峰高优先、灵敏度。Dynamic Performance Stats 带 RMS / Vector Averaging，是否可编辑取决于所选数据类型 |
+| FFT / Recording | 按 Number of Averages 或连续采集控制；显示 Run length，X Axis Span 可勾选 Same as run length；文件名、备注等与 Data Logger 分开保存。本次进入时为 50 次、12.8 s，并非改写原 20 s 记录配置 |
+| FFT / Freq | Maximum frequency to analyze；FFT Size 为 **128、256、512、1024、2048、4096、8192、16384、32768、65536、131072、262144**；显示谱线数和频率分辨率。进入时 2000 Hz 最大分析频率、4000 Hz 采样、1024 点、512 谱线、3.906 Hz 分辨率，符合界面采用的 fs/N 关系 |
+| FFT / Trigger | Free Run、External TTL Pos Edge、Analog Threshold Pos/Neg Edge、Software Triggered；阈值工程量与对应 V、通道、**0–100%** Pre Trigger Data Percent、触发标记；Trigger Mode 为 Auto Retrigger / User Accept-Reject。底部另有 Record Number、Accept / Reject、Link Time Series Data |
+| FFT / Window | 本机列表为 Rectangular、Hamming、Hanning、Bartlett、Blackman、BlackmanHarris、FlatTop；没有出现独立参考/响应窗或 Force / Exponential 参数 |
+| FFT 派生通道 | 可按原始通道添加 single channel FFT function、windowed time domain channel、time domain channel；可移除所选显示行。本次临时添加 Ain 0 的 FFT 行查看参数，随后撤销该行 |
+| FFT / Data | Function：Spectrum / AutoSpectrum / PSD；Integration：None / Single / Double；Display Function 入口。Scaling：dB/Linear、RMS/Peak/PkPk、dB Reference。Averaging：类型、权重、启用开关；模式为 RMS / Vector / PeakHold。支持 Auto-reprocess on parameter change 与 Apply settings to current data |
+| Digital Filter Configuration | 每通道 None / Bessel / Butterworth / Chebyshev；HighPass / LowPass / BandPass / BandStop；**1–10 阶**，Cutoff Freq 1/2、DbRipple；Frequency / Impulse / Step Response 三图、状态标志、Apply / Close。原四路均为 None，本次仅展开选项，没有改变或应用滤波 |
+
+### 官方示例读取与导出
+
+实际打开项目内原厂提供的 `resources/vendor/extracted/quickdaq/LocalAppData/Data Translation/QuickDAQ/Data/QuickDAQ FFT Analyzer Sample Data.hpf`。界面显示 Processing complete，两个来源为 DT9837-B(02) 和 DT9837-A(00)，15000 Hz、20480 扫描、5 次平均；时域加窗曲线和频谱正常显示。它不是本机 DT9837C 的新采集数据。
+
+| 页面 | 本次确认的细节 |
+|---|---|
+| 文件读取状态 | 采集启动、记录和硬件采集参数灰显；保留分析参数重处理、记录编号与时域联动入口；File / Export Data、Open Current Data In Excel 变为可用。关闭 HPF 后自动返回此前的 DT9837C Data Logger 配置 |
+| File Export | Time History Data / Frequency Domain Data；All enabled channels / Visible channels only；TXT / CSV。时域可保存全部数据或记录编号范围；频域可保存平均结果或源记录编号范围。本 FFT 样例的范围为 Record 0–4；不要将这里的“记录编号”当成 Data Logger 的单个扫描编号 |
+| 时间列与附表 | Seconds、milliSeconds、microSeconds、Date-Time String、Time String、Excel Time Format、Sample Number；Include statistics、Include device and channel info；文件命名方式、路径、Export、Open in Excel |
+| 高级导出边界 | 当前 FFT 示例的 Universal File Format-ASCII、Save Real data / Save Complex data 灰显；本次未执行 Export，也未验证导出数值 |
+| Y 轴右键 | Y Axis Setup、Zoom to Fit in View、Zoom to Fit All。设置页含主/次网格、Autoscale / Manual、Min / Max、Precision、Format、Lin/Log；示例频谱轴为 Log10。打开检查后原值关闭 |
+
+本次还观察到设备选择的流程边界：从主菜单进入 Device Selection 后原主界面退出，首次刷新显示 Device is in use；点 Cancel 后程序退出。重新打开后设备显示 Device is idle，仍选中原 DT9837-C，原采集配置恢复。**这只记录本次现象，尚未定位占用原因。** 重启清除了进入时屏幕上停留的 6912 扫描预览曲线，未改动已有 HPF 文件。
+
+结束时已关闭示例并回到 Data Logger：三路力通道、20 秒记录时长、1000.116 Hz 状态采样率、Software 触发和关闭的 Fixed 输出；状态为 Idle。本轮是功能入口盘点，没有执行全功能实测；硬件触发、AO 波形、真实记录暂停/续录、长记录、多设备同步及 Advanced FFT 仍不能据此标为已验证。
+
+LabDAQ 对照入口：[gui.py](../../labdaq/gui.py)、[engine.py](../../labdaq/engine.py)、[inputs.py](../../labdaq/inputs.py)、[signals.py](../../labdaq/signals.py)、[transport.py](../../labdaq/transport.py)、[processing.py](../../labdaq/processing.py)、[recording.py](../../labdaq/recording.py)、[hpf.py](../../labdaq/hpf.py)。实现状态来自既有代码与手册核对；本次新增界面观察不代表未实现能力已完成实机验证。

@@ -31,7 +31,7 @@ class CoreClient:
 
     def request(self, op, **fields):
         with socket.create_connection(("127.0.0.1", self.address["port"]), timeout=3) as connection:
-            connection.settimeout(5)
+            connection.settimeout(30 if op in ("start", "connect") else 5)
             request = {"token": self.address["token"], "op": op, **fields}
             connection.sendall(json.dumps(request, ensure_ascii=False, allow_nan=False).encode("utf-8") + b"\n")
             with connection.makefile("rb") as reader:
@@ -64,9 +64,14 @@ class CoreClient:
         deadline = time.monotonic() + 5
         # Readiness wait only: never resend a recording/control command.
         while time.monotonic() < deadline:
-            existing = cls.existing(endpoint)
-            if existing:
-                return existing
+            try:
+                client = cls(endpoint)
+            except FileNotFoundError:
+                client = None
+            # A restarted core can bind the same port before it replaces the
+            # old endpoint file. Do not send the previous process's token.
+            if client and client.address["pid"] == process.pid:
+                return client, client.request("poll")
             if process.poll() is not None:
                 raise RuntimeError(f"采集核心启动失败（退出码 {process.returncode}），检查端口 {port} 是否已占用")
             time.sleep(.025)
@@ -74,7 +79,6 @@ class CoreClient:
 
 
 class RemoteEngine:
-    source = "simulation"
     transport = None
 
     def __init__(self, client: CoreClient, state: dict):
@@ -91,15 +95,18 @@ class RemoteEngine:
 
     @classmethod
     def start_new(cls, config, channels, signal_settings, experiment, recording_root,
-                  recording_path=None, *, endpoint=DEFAULT_ENDPOINT):
+                  recording_path=None, *, endpoint=DEFAULT_ENDPOINT, source="simulation", connect_only=False):
         client, state = CoreClient.connect_or_start(endpoint)
         if state["running"]:
             raise RuntimeError("核心已有采集会话，请重新打开界面接回，不能覆盖当前实验")
-        profile = {"config": asdict(config), "actual_rate": plan_clock(config.sample_rate).actual_rate,
+        profile = {"source": source, "config": asdict(config), "actual_rate": plan_clock(config.sample_rate).actual_rate,
                    "channels": [asdict(c) for c in channels], "signal_settings": signal_settings.to_dict(),
                    "experiment": experiment, "recording_root": str(Path(recording_root).resolve())}
-        state = client.request("start", profile=profile,
-                               recording_path=str(Path(recording_path).resolve()) if recording_path else None)
+        if connect_only:
+            state = client.request("connect", profile=profile)
+        else:
+            state = client.request("start", profile=profile,
+                                   recording_path=str(Path(recording_path).resolve()) if recording_path else None)
         return cls(client, state)
 
     @classmethod
@@ -130,6 +137,10 @@ class RemoteEngine:
             self._closed.wait(.1 if not self.connection_error else 1)
 
     @property
+    def source(self):
+        return self.profile.get("source", "simulation")
+
+    @property
     def profile(self):
         return self._state["profile"]
 
@@ -144,6 +155,10 @@ class RemoteEngine:
     @property
     def running(self):
         return self._state["running"]
+
+    @property
+    def device_connected(self):
+        return self._state["device_connected"]
 
     @property
     def recording(self):
@@ -188,6 +203,9 @@ class RemoteEngine:
 
     def stop(self):
         self._call("stop")
+
+    def disconnect(self):
+        self._call("disconnect")
 
     def detach(self):
         self._closed.set()

@@ -281,3 +281,32 @@ def test_gui_zero_pause_and_normal_close_preserve_core_session(core, tmp_path):
                 window.deleteLater()
         QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.Type.DeferredDelete)
         app.processEvents()
+
+
+def test_usb_profile_load_is_offline_and_preserves_physical_channel(tmp_path, monkeypatch):
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6 import QtCore, QtWidgets as W
+    from labdaq.gui import MainWindow, configure_application
+    from labdaq.core_client import RemoteEngine
+    def no_hardware(*args, **kwargs):
+        raise AssertionError("Loading a saved configuration must not connect hardware")
+    monkeypatch.setattr(RemoteEngine, "start_new", no_hardware)
+    app = W.QApplication.instance() or W.QApplication([])
+    configure_application(app)
+    window = MainWindow(core_endpoint=tmp_path / "unused.json")
+    try:
+        window.scenario.setCurrentIndex(window.scenario.findData("usb"))
+        window.active_channels = (3,)
+        window.rate.setValue(1000)
+        path = tmp_path / "usb.json"
+        window.save_profile_to(path)
+        window.scenario.setCurrentIndex(window.scenario.findData("rust"))
+        window.load_profile_from(path)
+        assert window.scenario.currentData() == "usb" and window.active_channels == (3,)
+        assert window.engine is None and not window.input_button.isVisible()
+        assert "真实 USB" in window.mode_badge.text()
+    finally:
+        window.close()
+        window.deleteLater()
+        QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.Type.DeferredDelete)
+        app.processEvents()

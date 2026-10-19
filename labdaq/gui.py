@@ -251,15 +251,15 @@ class MainWindow(W.QMainWindow):
         self.latest_recording = self.engine.last_recording
         # Reconnect is read-only: changing the input selector must not stop the core.
         self.scenario.blockSignals(True)
-        self.scenario.setCurrentIndex(self.scenario.findData("rust"))
+        self.scenario.setCurrentIndex(self.scenario.findData("usb" if self.engine.source == "usb" else "rust"))
         self.scenario.blockSignals(False)
-        self.input_button.setVisible(True)
+        self.input_button.setVisible(self.engine.source != "usb")
         self.hpf_loop.setVisible(False)
         self.actual_rate.setText(f"实际时钟：{self.engine.sample_rate:,.3f} S/s")
         self._sync_channel_labels()
         self._refresh_input_info()
         self._refresh_buttons()
-        self.tell(f"已接回独立核心 · {'正在记录' if self.engine.recording else '预览中' if self.engine.running else '已停止'}"
+        self.tell(f"已接回独立核心 · {'正在记录' if self.engine.recording else '预览中' if self.engine.running else '已连接 · 未采集' if self.engine.device_connected else '已停止'}"
                   f" · {self.latest_recording or '尚无记录'}")
 
     def _build(self):
@@ -382,6 +382,7 @@ class MainWindow(W.QMainWindow):
         self.scenario.addItem("可配置电信号 · 电压模拟", "custom")
         self.scenario.addItem("原始 HPF · 按时间回放", "hpf")
         self.scenario.addItem("独立核心 · 电信号模拟", "rust")
+        self.scenario.addItem("DT9837C · 真实 USB 输入", "usb")
         ol.addWidget(self.scenario)
         self.input_button = button("配置电信号", self.edit_input)
         ol.addWidget(self.input_button)
@@ -420,13 +421,14 @@ class MainWindow(W.QMainWindow):
         layout.addLayout(split, 1)
         toolbar, tl = card()
         tr = W.QHBoxLayout()
+        self.device_button = button("连接设备", self.toggle_device_connection)
         self.preview_button = button("开始预览", self.start_preview, "primary")
         self.record_button = button("●  开始记录", self.toggle_record, "record")
         self.record_button.setCheckable(True)
         self.stop_button = button("■  停止采集", self.stop_acquisition)
         self.status_label = label("未开始", "sectionTitle")
         self.count_label = label("0 扫描 · 0.00 s", "muted")
-        for b in [self.preview_button, self.record_button, self.stop_button]:
+        for b in [self.device_button, self.preview_button, self.record_button, self.stop_button]:
             tr.addWidget(b)
         tr.addStretch()
         tr.addWidget(self.status_label)
@@ -545,7 +547,7 @@ class MainWindow(W.QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         frame, fl = card()
         fl.addWidget(label("独立 USB 接入研究", "sectionTitle"))
-        fl.addWidget(label("本版可只读枚举 USB 设备；真实采集、固件加载和 EEPROM 写入未开放。协议模拟与真实硬件不会自动切换。", "notice", True))
+        fl.addWidget(label("真实输入由独立核心连接 DT9837C。选择真实输入后可先连接设备，再开始预览；停止采集保持连接，断开设备关闭工作电源。扫描不改变设备配置。", "notice", True))
         row = W.QHBoxLayout()
         row.addWidget(button("查找 DT USB 设备", self.scan_devices))
         row.addWidget(button("冷启动离线验证", self.simulate_boot))
@@ -597,6 +599,8 @@ class MainWindow(W.QMainWindow):
         if mode == "hpf":
             self.input_info.setText(f"{self.input_hpf.path.name}\n保留原始电压、采样率及换算参数。"
                                     if self.input_hpf else "请选择原始 HPF；默认播完即停。")
+        elif mode == "usb":
+            self.input_info.setText("连接设备后保持绿灯；预览或记录时采集。停止采集保持连接，断开设备后关电源。")
         elif mode == "rust":
             self.input_info.setText("独立核心持续采样和保存。关闭窗口后继续；重新打开可接回同组。")
         elif mode == "custom":
@@ -695,6 +699,8 @@ class MainWindow(W.QMainWindow):
             self.mode_badge.setText("●  HPF 输入回放 · 非现场采集")
         elif self.scenario.currentData() == "rust":
             self.mode_badge.setText("●  独立核心模拟 · 非真实测量")
+        elif self.scenario.currentData() == "usb":
+            self.mode_badge.setText("●  DT9837C · 真实 USB 输入")
         else:
             self.mode_badge.setText("●  协议模拟 · 非真实测量")
 
@@ -703,6 +709,27 @@ class MainWindow(W.QMainWindow):
 
     def start_preview(self):
         self._begin_input()
+
+    def toggle_device_connection(self):
+        try:
+            if self.engine and self.engine.running:
+                raise RuntimeError("请先停止采集，再断开设备")
+            if isinstance(self.engine, RemoteEngine) and self.engine.device_connected:
+                self.engine.disconnect()
+                self.tell("设备已断开，工作电源已关闭。")
+            else:
+                self._discard_preview()
+                config = AcquisitionConfig(sample_rate=self.rate.value(), channels=self.active_channels,
+                                           ranges=tuple(self.ranges), coupling=tuple(self.coupling), iepe=tuple(self.iepe))
+                self.engine = RemoteEngine.start_new(config, self.channels, self.signal_settings,
+                    self.experiment.text(), self.recording_root, endpoint=self.core_endpoint,
+                    source="usb", connect_only=True)
+                self._error_shown = ""
+                self.actual_rate.setText(f"名义采样率：{self.engine.sample_rate:,.3f} S/s")
+                self.tell("设备已连接，工作电源已开启；尚未采集或记录。")
+        except (OSError, ValueError, RuntimeError) as exc:
+            self.tell(f"设备连接操作失败：{exc}")
+        self._refresh_buttons()
 
     def _begin_input(self, recording_path=None):
         if self.engine is not None and self.engine.running:
@@ -722,10 +749,11 @@ class MainWindow(W.QMainWindow):
             else:
                 config = AcquisitionConfig(sample_rate=self.rate.value(), channels=self.active_channels,
                                            ranges=tuple(self.ranges), coupling=tuple(self.coupling), iepe=tuple(self.iepe))
-            if mode == "rust":
+            if mode in ("rust", "usb"):
                 self.engine = RemoteEngine.start_new(config, self.channels, self.signal_settings,
                                                       self.experiment.text(), self.recording_root, recording_path,
-                                                      endpoint=self.core_endpoint)
+                                                      endpoint=self.core_endpoint,
+                                                      source="usb" if mode == "usb" else "simulation")
             else:
                 self.engine = AcquisitionEngine(config, self._selected_settings(), mode,
                                                 signal_settings=self.signal_settings if mode == "custom" else None,
@@ -735,10 +763,10 @@ class MainWindow(W.QMainWindow):
             if recording_path:
                 self.latest_recording = recording_path
             self.actual_rate.setText(f"实际时钟：{self.engine.sample_rate:,.3f} S/s")
-            self.actual_rate.setToolTip("HPF 文件保存的原始采样率，不重新取整。" if mode == "hpf" else "PLL 算法计算的模拟采样率。")
+            self.actual_rate.setToolTip("HPF 文件保存的原始采样率，不重新取整。" if mode == "hpf" else "PLL 寄存器计算的名义采样率；未进行外部时钟校准。")
             self.pause_plot.setChecked(False)
             self.live_plot.enableAutoRange()
-            origin = "HPF 输入回放" if mode == "hpf" else "模拟信号"
+            origin = "HPF 输入回放" if mode == "hpf" else "DT9837C 真实输入" if mode == "usb" else "模拟信号"
             self.tell(f"正在记录{origin} · {recording_path}" if recording_path else
                       f"正在预览{origin} · 尚未保存。点击“开始记录”保存原始电压与本次配置。")
         except Exception as exc:
@@ -749,7 +777,9 @@ class MainWindow(W.QMainWindow):
         try:
             if self.engine is not None:
                 self.engine.stop()
-            self.tell("采集已停止。已记录的数据可在“数据回看”中打开。")
+            connected = isinstance(self.engine, RemoteEngine) and self.engine.device_connected
+            self.tell("采集已停止，设备保持连接；点击“断开设备”可关闭工作电源。" if connected else
+                      "采集已停止。已记录的数据可在“数据回看”中打开。")
         except Exception as exc:
             self.tell(f"停止采集：{exc}")
         self._refresh_buttons()
@@ -778,6 +808,10 @@ class MainWindow(W.QMainWindow):
     def _refresh_buttons(self):
         running = self.engine is not None and self.engine.running
         recording = self.engine is not None and self.engine.recording
+        connected = isinstance(self.engine, RemoteEngine) and self.engine.device_connected
+        self.device_button.setVisible(self.scenario.currentData() == "usb")
+        self.device_button.setText("断开设备" if connected else "连接设备")
+        self.device_button.setEnabled(not running)
         from_hpf = self.scenario.currentData() == "hpf"
         self.preview_button.setEnabled(not running)
         self.stop_button.setEnabled(running)
@@ -793,11 +827,12 @@ class MainWindow(W.QMainWindow):
         self.experiment.setEnabled(not recording)
         ended = self.engine is not None and not self.engine.error and self.engine.termination_reason == "end_of_file"
         self.status_label.setText("正在记录" if recording else "预览中 · 未记录" if running else
-                                  "HPF 已播完" if ended else "已停止" if self.engine else "未开始")
+                                  "已连接 · 未采集" if connected else "HPF 已播完" if ended else
+                                  "已断开" if self.engine and self.engine.source == "usb" else "已停止" if self.engine else "未开始")
         if isinstance(self.engine, RemoteEngine) and self.engine.connection_error:
             self.status_label.setText("核心连接中断 · 状态未知")
             for widget in [self.preview_button, self.record_button, self.zero_button, self.scenario,
-                           self.rate, self.channel_button, self.load_config_button, self.input_button]:
+                           self.rate, self.channel_button, self.load_config_button, self.input_button, self.device_button]:
                 widget.setEnabled(False)
 
     def refresh(self):
@@ -832,7 +867,7 @@ class MainWindow(W.QMainWindow):
                     curve.setData([], [])
         total = self.engine.total_scans
         self.count_label.setText(f"{total:,} 扫描 · {total / self.engine.sample_rate:.2f} s")
-        origin = "HPF 循环回放（接缝为拼接）" if self.engine.source == "file_replay" and self.hpf_loop.isChecked() else "HPF 回放" if self.engine.source == "file_replay" else "电压模拟"
+        origin = "DT9837C 真实输入" if self.engine.source == "usb" else "HPF 循环回放（接缝为拼接）" if self.engine.source == "file_replay" and self.hpf_loop.isChecked() else "HPF 回放" if self.engine.source == "file_replay" else "电压模拟"
         self.live_info.setText(f"{origin} · {len(self.active_channels)} 路 · {self.engine.sample_rate:,.3f} S/s/通道 · 已记录 {self.engine.recorded_scans:,} 扫描")
         if self._tick % 5 == 0 and self.pages.currentIndex() == 1:
             self.refresh_analysis()
@@ -930,8 +965,8 @@ class MainWindow(W.QMainWindow):
             for channel in reader.channels:
                 channels[channel.index] = replace(channel)
         # Configure a simulator to validate external configuration before replacing UI state.
-        validation = AcquisitionEngine(config, [channels[i] for i in config.channels], "custom" if mode == "rust" else mode,
-                                       signal_settings=settings if mode in ("custom", "rust") else None,
+        validation = AcquisitionEngine(config, [channels[i] for i in config.channels], "custom" if mode in ("rust", "usb") else mode,
+                                       signal_settings=settings if mode in ("custom", "rust", "usb") else None,
                                        input_session=HpfReplaySession(reader, loop=data.get("hpf_loop", False)) if reader else None)
         validation.stop()
         self._discard_preview()
@@ -1137,6 +1172,11 @@ class MainWindow(W.QMainWindow):
         if self.engine is None:
             return
         if isinstance(self.engine, RemoteEngine):
+            if self.engine.source == "usb":
+                self.protocol_stats.setText("Rust 独立核心 · DT9837C USB")
+                self.protocol_log.setPlainText(json.dumps(self.engine.profile.get("device"), ensure_ascii=False, indent=2)
+                                              + "\n样本时间轴使用硬件采样率和扫描序号；不使用 GUI 刷新时间。")
+                return
             self.protocol_stats.setText("Rust 独立核心 · 不产生 USB 命令")
             self.protocol_log.setPlainText("核心负责电压生成、AC 演示模型、24 位量化和原始写盘。\n"
                                           "控制与显示通过本机连接；GUI 退出不停止采集。")
