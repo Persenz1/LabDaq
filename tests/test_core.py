@@ -10,10 +10,10 @@ from dataclasses import asdict
 import numpy as np
 import pytest
 
-from labdaq.core_client import CORE_EXE, ROOT, CoreClient
+from labdaq.core_client import CORE_EXE, ROOT, CoreClient, RemoteEngine
 from labdaq.processing import ChannelSettings, convert_volts
 from labdaq.protocol import AcquisitionConfig, plan_clock, encode_adc, decode_adc
-from labdaq.recording import load_session
+from labdaq.recording import load_session, export_csv
 from labdaq.signals import SignalSpec, SimulationSettings, generate_signals
 
 
@@ -152,7 +152,89 @@ def test_high_rate_ring_is_bounded_and_record_keeps_every_scan(core, tmp_path):
                                np.asarray(state["raw"]).reshape(-1, 4), atol=0, rtol=0)
 
 
-def test_killed_qt_process_keeps_recording_and_new_gui_rejoins(tmp_path):
+@pytest.mark.parametrize("during_preview", [False, True])
+def test_fixed_duration_exact_frames_and_next_group(core, tmp_path, during_preview):
+    p = profile(selected=(0, 3))
+    options = {"duration_seconds": .137, "notes": "正弦模拟 · 定长", "group_number": 1}
+    first = tmp_path / "first"
+    if during_preview:
+        core.request("start", profile=p)
+        until(lambda: core.request("poll")["total_scans"] >= 200)
+        state = core.request("start_recording", path=str(first), channels=p["channels"],
+                             experiment=p["experiment"], recording_options=options)
+    else:
+        p["recording_options"] = options
+        state = core.request("start", profile=p, recording_path=str(first))
+    target = max(1, int(np.floor(state["profile"]["actual_rate"] * .137 + .5)))
+    assert state["recording_target_scans"] == target
+    until(lambda: not core.request("poll")["recording"])
+    final = core.request("poll")
+    assert final["running"] and final["recording_remaining_scans"] == 0
+    assert final["termination_reason"] == "duration_complete"
+    result = load_session(first)
+    assert result.sample_count == result.metadata["target_sample_count"] == target
+    assert result.metadata["recording_options"] == options
+    start = result.metadata["acquisition_config"]["record_start_scan"]
+    assert (start > 0) == during_preview
+    expected = generate_signals(SimulationSettings(), start, target, result.sample_rate)[:, [0, 3]]
+    np.testing.assert_allclose(result.read(), expected, rtol=0, atol=20 / 2**24)
+    second = tmp_path / "second"
+    state = core.request("start_recording", path=str(second), channels=p["channels"], experiment="下一组")
+    assert state["recording_target_scans"] is None and state["termination_reason"] == "user_stop"
+    until(lambda: core.request("poll")["recorded_scans"] > target)
+    core.request("stop_recording")
+    assert load_session(second).metadata["termination_reason"] == "user_stop"
+
+
+def test_pause_reconnect_duration_and_export_preserve_source_gaps(core, tmp_path):
+    p = profile(selected=(0, 3))
+    p["recording_options"] = {"duration_seconds": .4}
+    path = tmp_path / "paused"
+    started = core.request("start", profile=p, recording_path=str(path))
+    until(lambda: core.request("poll")["recorded_scans"] >= 100)
+    paused = core.request("pause_recording")
+    captured, acquired = paused["recorded_scans"], paused["total_scans"]
+    until(lambda: core.request("poll")["total_scans"] >= acquired + 1000)
+    current = core.request("poll")
+    assert current["running"] and current["recording"] and current["recording_paused"]
+    assert current["recorded_scans"] == captured
+    assert current["recording_remaining_scans"] == paused["recording_remaining_scans"]
+    assert (path / "raw.f64").stat().st_size == captured * 2 * 8
+    assert load_session(path).metadata["recording_paused"]
+    rejoined = RemoteEngine.reconnect(core.endpoint)
+    try:
+        assert rejoined.recording and rejoined.recording_paused
+        assert rejoined.acquisition_started_at_utc == started["acquisition_started_at_utc"]
+        rejoined.resume_recording()
+        until(lambda: not core.request("poll")["recording"])
+        final = core.request("poll")
+        assert final["running"] and not final["recording_paused"]
+        assert final["termination_reason"] == "duration_complete"
+        session = load_session(path)
+        assert session.sample_count == 800
+        assert abs(session.duration - .4) <= .5 / session.sample_rate
+        assert session.elapsed_duration > .8
+        assert len(session.recording_segments) == 2
+        scans = session.sample_indices()
+        expected = generate_signals(SimulationSettings(), 0, int(scans[-1]) + 1, session.sample_rate)[scans][:, [0, 3]]
+        expected = decode_adc(encode_adc(expected, (10, 10)), (10, 10))
+        np.testing.assert_allclose(session.read(), expected, rtol=0, atol=20 / 2**24)
+        destination = export_csv(session, tmp_path / "paused.csv", time_format="samples", values="raw")
+        exported = np.loadtxt(destination, delimiter=",", skiprows=2, encoding="utf-8-sig")
+        np.testing.assert_array_equal(exported[:, 0], scans)
+        second = tmp_path / "manual-paused"
+        core.request("start_recording", path=str(second), channels=p["channels"], experiment="手动停止暂停组")
+        until(lambda: core.request("poll")["recorded_scans"] >= 100)
+        core.request("pause_recording")
+        final = core.request("stop")
+        assert not final["running"] and not final["recording"] and not final["recording_paused"]
+        assert load_session(second).metadata["termination_reason"] == "user_stop"
+    finally:
+        rejoined.detach()
+
+
+@pytest.mark.parametrize("duration", [None, .9])
+def test_killed_qt_process_keeps_recording_and_new_gui_rejoins(tmp_path, duration):
     if not CORE_EXE.exists():
         pytest.skip("Build the Rust core first")
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -166,7 +248,7 @@ from PySide6 import QtWidgets as W
 from labdaq.gui import MainWindow, configure_application
 from labdaq.core_client import CoreClient
 from labdaq.signals import SimulationSettings, SignalSpec
-endpoint, ready = map(Path, sys.argv[1:])
+endpoint, ready = map(Path, sys.argv[1:3])
 CoreClient.connect_or_start(endpoint, port=0)
 app = W.QApplication([])
 configure_application(app)
@@ -177,13 +259,14 @@ w.active_channels = (0, 2, 3)
 w.channels[2] = replace(w.channels[2], name="重连通道", zero_volts=.123, inverted=True)
 w.signal_settings = SimulationSettings(channels=(SignalSpec(frequency_hz=13.7),) * 4)
 w.experiment.setText("GUI崩溃续录")
+w._set_recording_options({"duration_seconds": json.loads(sys.argv[3]), "notes": "退出后自动结束"})
 w.toggle_record()
 assert w.engine and w.engine.recording, w.notice.text()
 w.show()
 ready.write_text(json.dumps({"path": str(w.latest_recording)}), encoding="utf-8")
 app.exec()
 '''
-    process = subprocess.Popen([sys.executable, "-c", source, str(endpoint), str(ready)], cwd=ROOT,
+    process = subprocess.Popen([sys.executable, "-c", source, str(endpoint), str(ready), json.dumps(duration)], cwd=ROOT,
                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     client = None
     window = None
@@ -196,12 +279,15 @@ app.exec()
         process.wait(5)
         until(lambda: client.request("poll")["recorded_scans"] >= before["recorded_scans"] + 600)
         assert (path / "raw.f64").stat().st_size > before["recorded_scans"] * 3 * 8
+        if duration is not None:
+            until(lambda: not client.request("poll")["recording"])
         from PySide6 import QtCore, QtWidgets as W
         from labdaq.gui import MainWindow, configure_application
         app = W.QApplication.instance() or W.QApplication([])
         configure_application(app)
         window = MainWindow(core_endpoint=endpoint)
-        assert window.engine.recording and window.latest_recording == path
+        assert window.engine.recording == (duration is None) and window.latest_recording == path
+        assert window.recording_duration_seconds == duration and window.recording_notes == "退出后自动结束"
         assert window.active_channels == (0, 2, 3)
         assert window.channels[2].name == "重连通道" and window.channels[2].zero_volts == .123
         assert window.channels[2].inverted and window.experiment.text() == "GUI崩溃续录"
@@ -214,7 +300,9 @@ app.exec()
         truth = decode_adc(encode_adc(truth, (10, 10, 10)), (10, 10, 10))
         np.testing.assert_allclose(recording.read(), truth, rtol=0, atol=20 / 2**24)
         assert recording.sample_count > before["recorded_scans"] + 600
-        assert recording.metadata["termination_reason"] == "user_stop"
+        assert recording.metadata["termination_reason"] == ("duration_complete" if duration is not None else "user_stop")
+        if duration is not None:
+            assert recording.sample_count == int(np.floor(recording.sample_rate * duration + .5))
         assert len(list(tmp_path.glob("*/metadata.json"))) == 1
     finally:
         if process.poll() is None:

@@ -101,3 +101,37 @@ def test_official_hpf_and_cold_boot_offline_views():
         window.deleteLater()
         QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.Type.DeferredDelete)
         app.processEvents()
+
+
+def test_fixed_groups_profile_notes_and_replay(tmp_path):
+    app = W.QApplication.instance() or W.QApplication([])
+    configure_application(app)
+    window = MainWindow(core_endpoint=tmp_path / "unused.json")
+    try:
+        window.recording_root = tmp_path
+        window.experiment.setText("顺序实验")
+        window._set_recording_options({"duration_seconds": .137, "notes": "加载 1 N\n模拟验证"})
+        profile = tmp_path / "profile.json"
+        window.save_profile_to(profile)
+        window._set_recording_options({})
+        window.load_profile_from(profile)
+        assert window.recording_duration_seconds == .137
+        assert window.recording_notes == "加载 1 N\n模拟验证"
+        for group in (1, 2):
+            window.toggle_record()
+            path = window.latest_recording
+            assert path.name.endswith(f"_顺序实验_{group:03d}")
+            assert not window.record_settings_button.isEnabled()
+            spin(app, lambda: not window.engine.recording and window.record_settings_button.isEnabled())
+            assert window.engine.running and window.record_settings_button.isEnabled()
+            recording = load_session(path)
+            assert recording.sample_count == int(recording.sample_rate * .137 + .5)
+            assert recording.metadata["recording_options"]["group_number"] == group
+            window.open_replay(path)
+            assert "加载 1 N" in window.replay_info.text()
+            assert "定长记录完成" in window.replay_info.text()
+    finally:
+        window.close()
+        window.deleteLater()
+        QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.Type.DeferredDelete)
+        app.processEvents()

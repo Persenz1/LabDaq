@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 from dataclasses import asdict, replace
-from datetime import datetime
+from datetime import datetime, timezone
 import argparse
 import json
+import math
 import os
 from pathlib import Path
-import re
+import shutil
 import sys
 
 import numpy as np
@@ -21,7 +22,10 @@ from .signals import SimulationSettings
 from .input_dialog import SignalDialog
 from .processing import ChannelSettings, convert_volts, spectrum, frequency_response, filter_window
 from .protocol import AcquisitionConfig
-from .recording import load_session, export_csv
+from .recording import load_session, next_recording_path
+from .data_dialog import ExportDialog, StatisticsDialog
+from .recording_library import RecordingLibraryDialog
+from .plot_measurements import PlotMeasurements
 from .transport import enumerate_usb_devices
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -219,6 +223,11 @@ class MainWindow(W.QMainWindow):
         self.core_endpoint = core_endpoint
         self.recording_root = ROOT / "recordings"
         self.latest_recording: Path | None = None
+        self.recording_duration_seconds: float | None = None
+        self.recording_notes = ""
+        self._completion_shown: Path | None = None
+        self._previous_zero: list[float] | None = None
+        self._live_cache = None
         self.replay = None
         self.replay_path: Path | None = None
         self.replay_is_hpf = False
@@ -246,6 +255,7 @@ class MainWindow(W.QMainWindow):
         self.signal_settings = SimulationSettings.from_dict(p["signal_settings"])
         self.rate.setValue(config.sample_rate)
         self.experiment.setText(p["experiment"])
+        self._set_recording_options(p["recording_options"])
         self.recording_root = Path(p["recording_root"])
         self.directory_label.setText(str(self.recording_root))
         self.latest_recording = self.engine.last_recording
@@ -359,6 +369,7 @@ class MainWindow(W.QMainWindow):
         self.pause_plot = W.QCheckBox("暂停滚动")
         self.pause_plot.setToolTip("只暂停曲线显示；采集和文件记录会继续。")
         plot_top.addWidget(self.pause_plot)
+        plot_top.addWidget(button("保存图像", lambda: self.save_plot_image(self.live_plot)))
         plot_top.addWidget(button("适应窗口", lambda: self.live_plot.enableAutoRange()))
         pl.addLayout(plot_top)
         self.live_plot = plot_widget()
@@ -366,11 +377,17 @@ class MainWindow(W.QMainWindow):
         self.live_curves = [self.live_plot.plot(pen=pg.mkPen(c, width=1.6), name=f"AI {i}", autoDownsample=True,
                                                downsampleMethod="peak") for i, c in enumerate(COLORS)]
         pl.addWidget(self.live_plot, 1)
-        self.live_info = label("时间轴来自样本序号 · 鼠标拖动平移，滚轮缩放", "muted")
+        self.live_measurements = PlotMeasurements(self.live_plot)
+        pl.addWidget(self.live_measurements)
+        self.live_info = label("时间轴来自样本序号 · 鼠标拖动平移，滚轮缩放", "muted", True)
         pl.addWidget(self.live_info)
         split.addWidget(plot_card, 1)
         options, ol = card()
-        options.setFixedWidth(280)
+        options_scroll = W.QScrollArea()
+        options_scroll.setWidgetResizable(True)
+        options_scroll.setFixedWidth(280)
+        options_scroll.setFrameShape(W.QFrame.Shape.NoFrame)
+        ol.setSizeConstraint(W.QLayout.SizeConstraint.SetMinimumSize)
         ol.addWidget(label("本次实验", "sectionTitle"))
         self.experiment = W.QLineEdit("力传感器实验")
         ol.addWidget(self.experiment)
@@ -400,24 +417,52 @@ class MainWindow(W.QMainWindow):
         self.actual_rate = label("实际时钟：开始后显示", "muted")
         self.actual_rate.setToolTip("此处显示 PLL 计算出的名义采样率；晶振误差和真实时序尚未测量。")
         ol.addWidget(self.actual_rate)
+        ol.addWidget(label("时间轴", "muted"))
+        self.live_time_axis = W.QComboBox()
+        for title, mode in (("相对时间", "relative"), ("绝对时间（电脑时钟）", "absolute"), ("样本号", "samples")):
+            self.live_time_axis.addItem(title, mode)
+        self.live_time_axis.currentIndexChanged.connect(lambda: self._time_axis_changed("live"))
+        ol.addWidget(self.live_time_axis)
+        ol.addWidget(label("数值读数（近 1 秒）", "muted"))
+        self.live_value_mode = W.QComboBox()
+        for title, mode in (("最新值", "last"), ("首值", "first"), ("均值", "mean"), ("最小值", "min"),
+                            ("最大值", "max"), ("RMS", "rms"), ("标准差", "std"), ("峰峰值", "delta")):
+            self.live_value_mode.addItem(title, mode)
+        ol.addWidget(self.live_value_mode)
+        self.value_decimals = W.QSpinBox()
+        self.value_decimals.setRange(0, 9)
+        self.value_decimals.setValue(3)
+        self.value_decimals.setPrefix("显示小数位：")
+        ol.addWidget(self.value_decimals)
         self.channel_button = button("通道与传感器设置", self.edit_channels)
         ol.addWidget(self.channel_button)
         self.zero_button = button("当前载荷设为零点", self.zero_channels)
         self.zero_button.setToolTip("以最近最多1秒原始电压的平均值设置零点，原始记录不变。")
         ol.addWidget(self.zero_button)
+        self.undo_zero_button = button("撤销上次调零", self.undo_zero)
+        self.undo_zero_button.setEnabled(False)
+        ol.addWidget(self.undo_zero_button)
         row = W.QHBoxLayout()
         self.save_config_button = button("保存配置", self.save_profile)
         self.load_config_button = button("载入配置", self.load_profile)
         row.addWidget(self.save_config_button)
         row.addWidget(self.load_config_button)
         ol.addLayout(row)
+        self.record_settings_button = button("记录设置 · 时长与备注", self.edit_recording_options)
+        ol.addWidget(self.record_settings_button)
+        self.record_settings_info = label("手动结束 · 自动编号", "muted", True)
+        ol.addWidget(self.record_settings_info)
         ol.addStretch()
         ol.addWidget(label("记录目录", "muted"))
         self.directory_label = label(str(self.recording_root), "muted", True)
         ol.addWidget(self.directory_label)
+        self.disk_space_label = label("", "muted")
+        ol.addWidget(self.disk_space_label)
+        self._refresh_disk_space()
         self.directory_button = button("更改目录", self.choose_directory)
         ol.addWidget(self.directory_button)
-        split.addWidget(options)
+        options_scroll.setWidget(options)
+        split.addWidget(options_scroll)
         layout.addLayout(split, 1)
         toolbar, tl = card()
         tr = W.QHBoxLayout()
@@ -425,10 +470,11 @@ class MainWindow(W.QMainWindow):
         self.preview_button = button("开始预览", self.start_preview, "primary")
         self.record_button = button("●  开始记录", self.toggle_record, "record")
         self.record_button.setCheckable(True)
+        self.pause_record_button = button("暂停记录", self.toggle_record_pause)
         self.stop_button = button("■  停止采集", self.stop_acquisition)
         self.status_label = label("未开始", "sectionTitle")
         self.count_label = label("0 扫描 · 0.00 s", "muted")
-        for b in [self.device_button, self.preview_button, self.record_button, self.stop_button]:
+        for b in [self.device_button, self.preview_button, self.record_button, self.pause_record_button, self.stop_button]:
             tr.addWidget(b)
         tr.addStretch()
         tr.addWidget(self.status_label)
@@ -503,14 +549,21 @@ class MainWindow(W.QMainWindow):
         row = W.QHBoxLayout()
         row.addWidget(label("原始记录回看", "sectionTitle"))
         row.addStretch()
+        row.addWidget(button("记录库", self.open_recording_library))
         row.addWidget(button("打开记录文件夹", self.choose_replay))
         row.addWidget(button("打开 HPF", self.choose_hpf))
         row.addWidget(button("打开最近记录", self.open_last_recording))
-        row.addWidget(button("导出 CSV", self.export_replay))
+        row.addWidget(button("导出数据", self.export_replay))
+        row.addWidget(button("保存图像", lambda: self.save_plot_image(self.replay_plot)))
         fl.addLayout(row)
         row = W.QHBoxLayout()
         row.addWidget(button("读取原厂 FFT 样例", self.open_vendor_sample))
         row.addWidget(button("分析此窗口", self.analyze_replay))
+        self.replay_time_axis = W.QComboBox()
+        for title, mode in (("相对时间", "relative"), ("绝对时间（电脑时钟）", "absolute"), ("样本号", "samples")):
+            self.replay_time_axis.addItem(title, mode)
+        self.replay_time_axis.currentIndexChanged.connect(lambda: self._time_axis_changed("replay"))
+        row.addWidget(self.replay_time_axis)
         row.addStretch()
         row.addWidget(label("显示时长", "muted"))
         self.replay_seconds = W.QDoubleSpinBox()
@@ -523,21 +576,66 @@ class MainWindow(W.QMainWindow):
         fl.addLayout(row)
         self.replay_info = label("支持原始记录、同步电压 HPF 和已验证的 DT9837C 力记录；按 HPF 原配置换算。", "notice", True)
         fl.addWidget(self.replay_info)
+        row = W.QHBoxLayout()
+        row.addWidget(label("显示与取数通道", "muted"))
+        self.replay_channel_checks = []
+        for i in range(4):
+            check = W.QCheckBox(f"AI {i}")
+            check.setEnabled(False)
+            check.toggled.connect(self.draw_replay)
+            self.replay_channel_checks.append(check)
+            row.addWidget(check)
+        row.addStretch()
+        self.statistics_button = button("统计所选数据", self.show_replay_statistics)
+        row.addWidget(self.statistics_button)
+        fl.addLayout(row)
         self.replay_plot = plot_widget()
         self.replay_plot.addLegend(offset=(10, 8), brush=(255, 255, 255, 235), pen="#E4EAF1")
         self.replay_curves = [self.replay_plot.plot(pen=pg.mkPen(c, width=1.5), name=f"AI {i}",
                                                   autoDownsample=True, downsampleMethod="peak") for i, c in enumerate(COLORS)]
+        self.replay_region = pg.LinearRegionItem(values=(0, 1), brush=(40, 120, 240, 30),
+                                                 pen=pg.mkPen("#2878F0", width=1))
+        self.replay_plot.addItem(self.replay_region, ignoreBounds=True)
+        self.replay_region.hide()
+        self.replay_region.sigRegionChangeFinished.connect(self._replay_region_changed)
         fl.addWidget(self.replay_plot, 1)
+        self.replay_measurements = PlotMeasurements(self.replay_plot)
+        fl.addWidget(self.replay_measurements)
         row = W.QHBoxLayout()
-        row.addWidget(label("浏览位置", "muted"))
+        row.addWidget(button("上一窗口", lambda: self.step_replay(-1)))
+        row.addWidget(button("下一窗口", lambda: self.step_replay(1)))
+        self.replay_start = W.QDoubleSpinBox()
+        self.replay_start.setDecimals(9)
+        self.replay_start.setRange(0, 0)
+        self.replay_start.setSuffix(" s")
+        self.replay_start.valueChanged.connect(self.draw_replay)
+        row.addWidget(label("起点", "muted"))
+        row.addWidget(self.replay_start)
         self.replay_slider = W.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.replay_slider.setRange(0, 1000)
-        self.replay_slider.valueChanged.connect(self.draw_replay)
+        self.replay_slider.valueChanged.connect(self._replay_slider_changed)
         row.addWidget(self.replay_slider, 1)
         self.replay_position = label("0.00 s", "muted")
         row.addWidget(self.replay_position)
         fl.addLayout(row)
-        fl.addWidget(label("滑块定位，显示时长控制细节；每次最多 200,000 扫描，长记录不会整体读入内存。", "muted"))
+        row = W.QHBoxLayout()
+        self.replay_select = W.QCheckBox("使用选区")
+        self.replay_select.toggled.connect(self._replay_selection_changed)
+        row.addWidget(self.replay_select)
+        self.selection_start, self.selection_stop = W.QDoubleSpinBox(), W.QDoubleSpinBox()
+        for spin in (self.selection_start, self.selection_stop):
+            spin.setDecimals(9)
+            spin.setRange(0, 0)
+            spin.setSuffix(" s")
+            spin.setEnabled(False)
+            spin.valueChanged.connect(self._replay_selection_changed)
+        row.addWidget(self.selection_start)
+        row.addWidget(label("至", "muted"))
+        row.addWidget(self.selection_stop)
+        row.addWidget(button("选当前窗口", self.select_replay_window))
+        row.addStretch()
+        fl.addLayout(row)
+        fl.addWidget(label("统计与导出使用勾选通道；未启用选区时处理全记录。选区按最近样本边界取整，右端不含。", "muted", True))
         layout.addWidget(frame)
         return page
 
@@ -731,7 +829,7 @@ class MainWindow(W.QMainWindow):
             self.tell(f"设备连接操作失败：{exc}")
         self._refresh_buttons()
 
-    def _begin_input(self, recording_path=None):
+    def _begin_input(self, recording_path=None, *, recording_options=None):
         if self.engine is not None and self.engine.running:
             return
         try:
@@ -753,12 +851,14 @@ class MainWindow(W.QMainWindow):
                 self.engine = RemoteEngine.start_new(config, self.channels, self.signal_settings,
                                                       self.experiment.text(), self.recording_root, recording_path,
                                                       endpoint=self.core_endpoint,
-                                                      source="usb" if mode == "usb" else "simulation")
+                                                      source="usb" if mode == "usb" else "simulation",
+                                                      recording_options=recording_options or self._recording_options())
             else:
                 self.engine = AcquisitionEngine(config, self._selected_settings(), mode,
                                                 signal_settings=self.signal_settings if mode == "custom" else None,
                                                 input_session=session)
-                self.engine.start(recording_path=recording_path)
+                self.engine.start(recording_path=recording_path, recording_options=recording_options,
+                                  experiment=self.experiment.text())
             self._error_shown = ""
             if recording_path:
                 self.latest_recording = recording_path
@@ -790,15 +890,16 @@ class MainWindow(W.QMainWindow):
                 self.engine.stop_recording()
                 self.tell(f"记录已保存 · {self.latest_recording}")
             else:
-                name = re.sub(r'[\\/:*?"<>|]', "_", self.experiment.text().strip()) or "实验"
-                path = self.recording_root / f"{datetime.now():%Y%m%d-%H%M%S-%f}_{name}"
+                path, group_number = next_recording_path(self.recording_root, self.experiment.text())
+                options = self._recording_options(group_number)
                 if self.engine is None or not self.engine.running:
-                    self._begin_input(recording_path=path)
+                    self._begin_input(recording_path=path, recording_options=options)
                     return
                 if isinstance(self.engine, RemoteEngine):
-                    self.engine.start_recording(path, self.channels, self.experiment.text())
+                    self.engine.start_recording(path, self.channels, self.experiment.text(), recording_options=options)
                 else:
-                    self.engine.start_recording(path, self._selected_settings())
+                    self.engine.start_recording(path, self._selected_settings(), recording_options=options,
+                                                experiment=self.experiment.text())
                 self.latest_recording = path
                 self.tell(f"正在记录当前输入 · 原始电压、来源和换算参数保存在 {path}")
         except Exception as exc:
@@ -817,26 +918,52 @@ class MainWindow(W.QMainWindow):
         self.stop_button.setEnabled(running)
         self.record_button.setChecked(recording)
         self.record_button.setText("■  结束记录" if recording else "●  开始记录")
+        paused = recording and self.engine.recording_paused
+        self.pause_record_button.setEnabled(recording and running)
+        self.pause_record_button.setText("继续记录" if paused else "暂停记录")
         for widget in [self.scenario, self.load_config_button, self.input_button, self.hpf_loop]:
             widget.setEnabled(not running)
         self.rate.setEnabled(not running and not from_hpf)
         self.channel_button.setEnabled(not running and not from_hpf)
         self.zero_button.setEnabled(running and not recording and not from_hpf)
+        self.undo_zero_button.setEnabled(running and not recording and not from_hpf and self._previous_zero is not None)
         self.fault_button.setEnabled(running and self.engine.transport is not None)
         self.directory_button.setEnabled(not recording)
         self.experiment.setEnabled(not recording)
+        self.record_settings_button.setEnabled(not recording)
         ended = self.engine is not None and not self.engine.error and self.engine.termination_reason == "end_of_file"
         self.status_label.setText("正在记录" if recording else "预览中 · 未记录" if running else
                                   "已连接 · 未采集" if connected else "HPF 已播完" if ended else
                                   "已断开" if self.engine and self.engine.source == "usb" else "已停止" if self.engine else "未开始")
+        if not recording and running and self.engine.termination_reason == "duration_complete":
+            self.status_label.setText("定长已完成 · 预览中")
+        if paused:
+            self.status_label.setText("记录已暂停 · 预览继续")
         if isinstance(self.engine, RemoteEngine) and self.engine.connection_error:
             self.status_label.setText("核心连接中断 · 状态未知")
             for widget in [self.preview_button, self.record_button, self.zero_button, self.scenario,
-                           self.rate, self.channel_button, self.load_config_button, self.input_button, self.device_button]:
+                           self.rate, self.channel_button, self.load_config_button, self.input_button, self.device_button,
+                           self.record_settings_button, self.undo_zero_button, self.pause_record_button]:
                 widget.setEnabled(False)
+
+    def toggle_record_pause(self):
+        if self.engine is None or not self.engine.recording:
+            return
+        try:
+            if self.engine.recording_paused:
+                self.engine.resume_recording()
+                self.tell("已继续本组记录；暂停区间保留时间缺口。")
+            else:
+                self.engine.pause_recording()
+                self.tell("记录已暂停；输入和预览继续，定长剩余帧数保持不变。")
+        except (OSError, ValueError, RuntimeError) as exc:
+            self.tell(f"暂停/继续记录失败：{exc}")
+        self._refresh_buttons()
 
     def refresh(self):
         self._tick += 1
+        if self._tick % 50 == 0:
+            self._refresh_disk_space()
         if self.engine is None:
             return
         self._refresh_buttons()
@@ -846,33 +973,119 @@ class MainWindow(W.QMainWindow):
         if self.engine.error and self.engine.error != self._error_shown:
             self._error_shown = self.engine.error
             self.tell(f"采集已中止：{self.engine.error}。已有记录已尝试关闭；可重新开始预览。")
+        if (not self.engine.recording and self.engine.termination_reason == "duration_complete"
+                and self.engine.last_recording != self._completion_shown):
+            self._completion_shown = self.engine.last_recording
+            self.tell(f"本组定长记录已完成并保存 · {self.engine.last_recording}")
         times, raw = self.engine.snapshot()
         if len(raw) == 0:
             return
         converted = convert_volts(raw, self._selected_settings())
         for j, i in enumerate(self.active_channels):
             c = self.channels[i]
-            self.metric_values[i].setText(f"{converted[-1, j]:.3f}")
             recent = converted[-min(len(raw), max(1, round(self.engine.sample_rate))):, j]
+            mode = self.live_value_mode.currentData()
+            value = {"last": lambda: recent[-1], "first": lambda: recent[0],
+                     "mean": lambda: np.mean(recent), "min": lambda: np.min(recent),
+                     "max": lambda: np.max(recent), "rms": lambda: np.sqrt(np.mean(recent ** 2)),
+                     "std": lambda: np.std(recent), "delta": lambda: np.ptp(recent)}[mode]()
+            self.metric_values[i].setText(f"{value:.{self.value_decimals.value()}f}")
             clipped = bool(np.any(np.abs(raw[-min(len(raw), 1000):, j]) >= self.ranges[i] * 0.9999))
-            self.metric_subs[i].setText("输入已到量程边界" if clipped else f"近 1 秒峰值  {np.max(np.abs(recent)):.3f} {c.unit}")
+            self.metric_subs[i].setText("输入已到量程边界" if clipped else
+                                       f"{self.live_value_mode.currentText()} · 近 {len(recent) / self.engine.sample_rate:.3f} s · {c.unit}")
         if not self.pause_plot.isChecked():
-            units = {c.unit for c in self._selected_settings()}
-            self.live_plot.setLabel("left", "工程值" if len(units) == 1 else "原始电压", units=next(iter(units)) if len(units) == 1 else "V")
-            values = converted if len(units) == 1 else raw
-            for i, curve in enumerate(self.live_curves):
-                if i in self.active_channels:
-                    curve.setData(times, values[:, self.active_channels.index(i)])
-                else:
-                    curve.setData([], [])
+            self._live_cache = times, raw
+            self._draw_live(times, raw)
         total = self.engine.total_scans
-        self.count_label.setText(f"{total:,} 扫描 · {total / self.engine.sample_rate:.2f} s")
+        if self.engine.recording:
+            count = self.engine.recorded_scans
+            remaining = self.engine.recording_remaining_scans
+            suffix = f" · 剩余 {remaining / self.engine.sample_rate:.2f} s" if remaining is not None else ""
+            self.count_label.setText(f"本组 {count:,} 扫描 · {count / self.engine.sample_rate:.2f} s{suffix}")
+        else:
+            self.count_label.setText(f"{total:,} 扫描 · {total / self.engine.sample_rate:.2f} s")
         origin = "DT9837C 真实输入" if self.engine.source == "usb" else "HPF 循环回放（接缝为拼接）" if self.engine.source == "file_replay" and self.hpf_loop.isChecked() else "HPF 回放" if self.engine.source == "file_replay" else "电压模拟"
-        self.live_info.setText(f"{origin} · {len(self.active_channels)} 路 · {self.engine.sample_rate:,.3f} S/s/通道 · 已记录 {self.engine.recorded_scans:,} 扫描")
+        timing = ""
+        if self.live_time_axis.currentData() == "absolute":
+            epoch = self._timestamp(self.engine.acquisition_started_at_utc)
+            if epoch is not None:
+                timing = " · 当前 " + datetime.fromtimestamp(epoch + times[-1]).astimezone().isoformat(timespec="milliseconds")
+        self.live_info.setText(f"{origin} · {len(self.active_channels)} 路 · {self.engine.sample_rate:,.3f} S/s/通道 · 已记录 {self.engine.recorded_scans:,} 扫描{timing}")
         if self._tick % 5 == 0 and self.pages.currentIndex() == 1:
             self.refresh_analysis()
         if self._tick % 5 == 0 and self.pages.currentIndex() == 3:
             self.refresh_protocol()
+
+    @staticmethod
+    def _timestamp(value):
+        if not value:
+            return None
+        try:
+            date = datetime.fromisoformat(value)
+            return (date if date.tzinfo else date.replace(tzinfo=timezone.utc)).timestamp()
+        except (TypeError, ValueError):
+            return None
+
+    def _replay_epoch(self):
+        if self.replay is None:
+            return None
+        metadata = self.replay.metadata
+        epoch = self._timestamp(metadata.get("acquisition_started_at_utc"))
+        if epoch is not None:
+            start = metadata.get("acquisition_config", {}).get("record_start_scan", 0)
+            return epoch + start / self.replay.sample_rate
+        return self._timestamp(metadata.get("started_at_utc"))
+
+    @staticmethod
+    def _time_axis_values(plot, times, mode, epoch, sample_rate):
+        absolute = mode == "absolute" and epoch is not None
+        if absolute != isinstance(plot.getAxis("bottom"), pg.DateAxisItem):
+            plot.setAxisItems({"bottom": pg.DateAxisItem() if absolute else pg.AxisItem("bottom")})
+        if absolute:
+            plot.setLabel("bottom", "电脑时钟（本地时间）")
+            return epoch + times
+        if mode == "samples":
+            plot.setLabel("bottom", "样本号")
+            return np.rint(times * sample_rate)
+        plot.setLabel("bottom", "相对时间", units="s")
+        return times
+
+    def _time_axis_changed(self, source):
+        combo = self.live_time_axis if source == "live" else self.replay_time_axis
+        measurements = self.live_measurements if source == "live" else self.replay_measurements
+        cursor_times = measurements.measurements.get("times")
+        epoch = (self._timestamp(self.engine.acquisition_started_at_utc) if self.engine else None) if source == "live" else self._replay_epoch()
+        available = self.engine is not None if source == "live" else self.replay is not None
+        if available and combo.currentData() == "absolute" and epoch is None:
+            combo.blockSignals(True)
+            combo.setCurrentIndex(0)
+            combo.blockSignals(False)
+            self.tell("此输入没有可用的绝对起点，使用相对时间；不会以文件修改时间代替。")
+        if source == "live":
+            if self._live_cache is not None:
+                self._draw_live(*self._live_cache)
+        elif self.replay is not None:
+            self.draw_replay()
+        if cursor_times and available:
+            rate = self.engine.sample_rate if source == "live" else self.replay.sample_rate
+            for line, timestamp in zip(measurements.cursor_lines, cursor_times):
+                line.setValue(epoch + timestamp if combo.currentData() == "absolute" and epoch is not None else
+                              round(timestamp * rate) if combo.currentData() == "samples" else timestamp)
+
+    def _draw_live(self, times, raw):
+        channels = self._selected_settings()
+        units = {c.unit for c in channels}
+        unit = next(iter(units)) if len(units) == 1 else "V"
+        self.live_plot.setLabel("left", "工程值" if len(units) == 1 else "原始电压", units=unit)
+        values = convert_volts(raw, channels) if len(units) == 1 else raw
+        epoch = self._timestamp(self.engine.acquisition_started_at_utc)
+        x = self._time_axis_values(self.live_plot, times, self.live_time_axis.currentData(), epoch, self.engine.sample_rate)
+        for i, curve in enumerate(self.live_curves):
+            if i in self.active_channels:
+                curve.setData(x, values[:, self.active_channels.index(i)])
+            else:
+                curve.setData([], [])
+        self.live_measurements.set_data(times, values, [(f"AI {c.index} · {c.name}", unit) for c in channels], x_values=x)
 
     def zero_channels(self):
         if self.engine is None or not self.engine.running or self.engine.recording:
@@ -880,6 +1093,7 @@ class MainWindow(W.QMainWindow):
         _, raw = self.engine.snapshot(seconds=1)
         if not len(raw):
             return
+        previous = [c.zero_volts for c in self.channels]
         for j, i in enumerate(self.active_channels):
             self.channels[i] = replace(self.channels[i], zero_volts=float(np.mean(raw[:, j])))
         if isinstance(self.engine, RemoteEngine):
@@ -889,7 +1103,24 @@ class MainWindow(W.QMainWindow):
                 self.channels = [ChannelSettings(**c) for c in self.engine.profile["channels"]]
                 self.tell(f"调零未确认：{exc}")
                 return
+        self._previous_zero = previous
+        self._refresh_buttons()
         self.tell("已将最近最多 1 秒的平均电压设为零点。请在实际实验中确认此时为空载；原始电压未修改。")
+
+    def undo_zero(self):
+        if self.engine is None or not self.engine.running or self.engine.recording or self._previous_zero is None:
+            return
+        channels = [replace(c, zero_volts=zero) for c, zero in zip(self.channels, self._previous_zero)]
+        if isinstance(self.engine, RemoteEngine):
+            try:
+                self.engine.set_channels(channels)
+            except (OSError, ValueError, RuntimeError) as exc:
+                self.tell(f"撤销调零未确认：{exc}")
+                return
+        self.channels = channels
+        self._previous_zero = None
+        self._refresh_buttons()
+        self.tell("已恢复上次调零前的零点；原始电压未修改。")
 
     def edit_channels(self):
         if ChannelDialog(self).exec() == W.QDialog.DialogCode.Accepted:
@@ -898,6 +1129,9 @@ class MainWindow(W.QMainWindow):
             self.tell("通道设置已更新。开始预览后生效。")
 
     def _discard_preview(self):
+        self._previous_zero = None
+        self._live_cache = None
+        self.live_measurements.set_data([], np.empty((0, 0)), [])
         if self.engine:
             self.engine.stop()
             if isinstance(self.engine, RemoteEngine):
@@ -917,6 +1151,53 @@ class MainWindow(W.QMainWindow):
         if result:
             self.recording_root = Path(result)
             self.directory_label.setText(result)
+            self._refresh_disk_space()
+
+    def _refresh_disk_space(self):
+        path = self.recording_root if self.recording_root.exists() else self.recording_root.parent
+        try:
+            free = shutil.disk_usage(path).free
+            self.disk_space_label.setText(f"可用空间：{free / 1024 ** 3:,.2f} GiB")
+        except OSError as exc:
+            self.disk_space_label.setText(f"无法读取可用空间：{exc}")
+
+    def _recording_options(self, group_number=0):
+        return {"duration_seconds": self.recording_duration_seconds,
+                "notes": self.recording_notes, "group_number": group_number}
+
+    def _set_recording_options(self, options):
+        self.recording_duration_seconds = options.get("duration_seconds")
+        self.recording_notes = options.get("notes", "")
+        duration = self.recording_duration_seconds
+        self.record_settings_info.setText(
+            (f"定长 {duration:g} s" if duration is not None else "手动结束") + " · 自动编号"
+            + (" · 已填备注" if self.recording_notes else ""))
+
+    def edit_recording_options(self):
+        dialog = W.QDialog(self)
+        dialog.setWindowTitle("本组记录设置")
+        dialog.setMinimumWidth(440)
+        layout = W.QVBoxLayout(dialog)
+        form = W.QFormLayout()
+        duration = W.QDoubleSpinBox()
+        duration.setDecimals(3)
+        duration.setRange(0, 999999999)
+        duration.setSuffix(" s")
+        duration.setSpecialValueText("手动结束")
+        duration.setValue(self.recording_duration_seconds or 0)
+        form.addRow("记录时长（0 为手动）", duration)
+        notes = W.QPlainTextEdit(self.recording_notes)
+        notes.setMaximumHeight(120)
+        form.addRow("本组备注", notes)
+        layout.addLayout(form)
+        layout.addWidget(label("每组按日期与实验名自动编号。定长按实际采样率换算为整数帧；完成后保存并继续预览。", "muted", True))
+        buttons = W.QDialogButtonBox(W.QDialogButtonBox.StandardButton.Ok | W.QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() == W.QDialog.DialogCode.Accepted:
+            self._set_recording_options({"duration_seconds": duration.value() or None,
+                                         "notes": notes.toPlainText()})
 
     def save_profile(self):
         path, _ = W.QFileDialog.getSaveFileName(self, "保存实验配置", str(ROOT / "实验配置.json"), "JSON 配置 (*.json)")
@@ -928,6 +1209,11 @@ class MainWindow(W.QMainWindow):
                 "active_channels": self.active_channels, "ranges": self.ranges, "coupling": self.coupling,
                 "iepe": self.iepe, "sample_rate": self.rate.value(), "scenario": self.scenario.currentData(),
                 "experiment": self.experiment.text(), "signal_settings": self.signal_settings.to_dict(),
+                "recording_options": self._recording_options(),
+                "display": {"live_time_axis": self.live_time_axis.currentData(),
+                            "replay_time_axis": self.replay_time_axis.currentData(),
+                            "value_mode": self.live_value_mode.currentData(),
+                            "value_decimals": self.value_decimals.value()},
                 "input_hpf": str(self.input_hpf.path.resolve()) if self.input_hpf else None,
                 "hpf_loop": self.hpf_loop.isChecked()}
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -954,6 +1240,22 @@ class MainWindow(W.QMainWindow):
         if self.scenario.findData(mode) < 0:
             raise ValueError("未知输入来源")
         settings = SimulationSettings.from_dict(data["signal_settings"]) if "signal_settings" in data else SimulationSettings()
+        options = data.get("recording_options", {})
+        duration = options.get("duration_seconds")
+        if duration is not None and (not isinstance(duration, (int, float)) or isinstance(duration, bool)
+                                     or not math.isfinite(duration) or not 0 < duration <= 999999999):
+            raise ValueError("记录时长必须为正的有限秒数，手动结束使用 null")
+        if not isinstance(options.get("notes", ""), str):
+            raise ValueError("记录备注必须为文字")
+        display = data.get("display", {})
+        for key, combo, default in (("live_time_axis", self.live_time_axis, "relative"),
+                                    ("replay_time_axis", self.replay_time_axis, "relative"),
+                                    ("value_mode", self.live_value_mode, "last")):
+            if combo.findData(display.get(key, default)) < 0:
+                raise ValueError("未知的显示模式")
+        decimals = display.get("value_decimals", 3)
+        if type(decimals) is not int or not 0 <= decimals <= 9:
+            raise ValueError("显示小数位必须是 0 到 9 的整数")
         reader = None
         if mode == "hpf":
             from .hpf import open_hpf
@@ -980,6 +1282,11 @@ class MainWindow(W.QMainWindow):
         self.scenario.setCurrentIndex(self.scenario.findData(mode))
         self._input_changed()
         self.experiment.setText(data["experiment"])
+        self._set_recording_options(options)
+        self.live_time_axis.setCurrentIndex(self.live_time_axis.findData(display.get("live_time_axis", "relative")))
+        self.replay_time_axis.setCurrentIndex(self.replay_time_axis.findData(display.get("replay_time_axis", "relative")))
+        self.live_value_mode.setCurrentIndex(self.live_value_mode.findData(display.get("value_mode", "last")))
+        self.value_decimals.setValue(decimals)
         self._sync_channel_labels()
         self.tell(f"配置已载入 · {path.name}")
 
@@ -992,7 +1299,7 @@ class MainWindow(W.QMainWindow):
                 self._clear_analysis()
                 self.analysis_info.setText("请先在“数据回看”中打开记录或 HPF 文件。")
                 return
-            raw, _, _ = self._replay_window()
+            raw, start, reader = self._replay_window()
             fs, settings = self.replay.sample_rate, self.replay.channels
         else:
             if self.engine is None:
@@ -1005,7 +1312,15 @@ class MainWindow(W.QMainWindow):
             self.analysis_info.setText("等待至少 32 个扫描点。")
             return
         # Fixed upper bound keeps plotting and analysis responsive at high rates.
+        original_length = len(raw)
         raw = raw[-65536:]
+        if from_replay:
+            analysis_start = start + max(0, original_length - len(raw))
+            times = self._replay_times(reader, analysis_start, len(raw))
+            if np.any(np.diff(times) > 1.5 / fs):
+                self._clear_analysis()
+                self.analysis_info.setText("当前窗口包含暂停缺口，请选择一个连续段再分析。")
+                return
         values = convert_volts(raw, settings)
         indices = [c.index for c in settings]
         selected = self.analysis_channel.currentData()
@@ -1052,6 +1367,11 @@ class MainWindow(W.QMainWindow):
         if result:
             self.open_replay(Path(result))
 
+    def open_recording_library(self):
+        dialog = RecordingLibraryDialog(self.recording_root, self)
+        if dialog.exec() == W.QDialog.DialogCode.Accepted:
+            self.open_replay(dialog.selected_path)
+
     def open_last_recording(self):
         if self.latest_recording:
             self.open_replay(self.latest_recording)
@@ -1076,8 +1396,27 @@ class MainWindow(W.QMainWindow):
             self.replay = reader
             self.replay_is_hpf = is_hpf
             self.replay_path = path
-            self.replay_slider.setValue(0)
-            self.draw_replay()
+            for i, check in enumerate(self.replay_channel_checks):
+                channel = next((c for c in reader.channels if c.index == i), None)
+                check.blockSignals(True)
+                check.setEnabled(channel is not None)
+                check.setChecked(channel is not None)
+                check.setText(f"AI {i} · {channel.name}" if channel else f"AI {i}")
+                check.blockSignals(False)
+            duration = getattr(reader, "elapsed_duration", reader.duration)
+            for spin, value in ((self.selection_start, 0), (self.selection_stop, duration)):
+                spin.blockSignals(True)
+                spin.setRange(0, duration)
+                spin.setSingleStep(1 / reader.sample_rate)
+                spin.setValue(value)
+                spin.blockSignals(False)
+            self.replay_select.setChecked(False)
+            self._replay_selection_changed()
+            self.replay_start.blockSignals(True)
+            self.replay_start.setValue(0)
+            self.replay_start.setSingleStep(1 / reader.sample_rate)
+            self.replay_start.blockSignals(False)
+            self._time_axis_changed("replay")
             self._analysis_source_changed()
             self.nav.setCurrentRow(2)
         except (OSError, ValueError, KeyError) as exc:
@@ -1085,35 +1424,147 @@ class MainWindow(W.QMainWindow):
 
     def _replay_window(self):
         r = self.replay
-        count = min(200000, max(1, round(r.sample_rate * self.replay_seconds.value())), r.sample_count)
-        start = round(max(0, r.sample_count - count) * self.replay_slider.value() / 1000)
-        raw = r.read(start=start, count=count)
+        span = min(self.replay_seconds.value(), 200000 / r.sample_rate)
+        maximum = max(0, getattr(r, "elapsed_duration", r.duration) - span)
+        time_start = min(self.replay_start.value(), maximum)
+        start = self._replay_boundary(time_start)
+        stop = self._replay_boundary(time_start + span)
+        raw = r.read(start=start, count=min(200000, stop - start))
         return raw, start, r
+
+    def _replay_boundary(self, seconds):
+        reader = self.replay
+        scan = max(0, math.floor(seconds * reader.sample_rate + .5))
+        if hasattr(reader, "sample_index_at_time"):
+            return reader.sample_index_at_time(scan / reader.sample_rate)
+        return min(scan, reader.sample_count)
+
+    @staticmethod
+    def _replay_times(reader, start, count):
+        return (reader.sample_times(start, count) if hasattr(reader, "sample_times") else
+                (start + np.arange(count)) / reader.sample_rate)
+
+    def _replay_x(self, times):
+        return self._time_axis_values(self.replay_plot, np.asarray(times), self.replay_time_axis.currentData(),
+                                      self._replay_epoch(), self.replay.sample_rate)
+
+    def _replay_slider_changed(self, position):
+        if self.replay is None:
+            return
+        self.replay_start.setValue(self.replay_start.maximum() * position / 1000)
+
+    def step_replay(self, direction):
+        if self.replay is not None:
+            span = min(self.replay_seconds.value(), 200000 / self.replay.sample_rate)
+            self.replay_start.setValue(self.replay_start.value() + direction * span)
+
+    def select_replay_window(self):
+        if self.replay is None:
+            return
+        raw, start, reader = self._replay_window()
+        times = self._replay_times(reader, start, len(raw))
+        self.selection_start.setValue(times[0] if len(times) else self.replay_start.value())
+        self.selection_stop.setValue(times[-1] + 1 / reader.sample_rate if len(times) else
+                                     self.replay_start.value() + self.replay_seconds.value())
+        self.replay_select.setChecked(True)
+
+    def _replay_selection_changed(self, *_):
+        selected = self.replay_select.isChecked()
+        for spin in (self.selection_start, self.selection_stop):
+            spin.setEnabled(selected and self.replay is not None)
+        self.replay_region.setVisible(selected and self.replay is not None)
+        if self.replay is None:
+            return
+        self.replay_region.blockSignals(True)
+        duration = getattr(self.replay, "elapsed_duration", self.replay.duration)
+        self.replay_region.setBounds(tuple(self._replay_x([0, duration])))
+        self.replay_region.setRegion(tuple(self._replay_x([self.selection_start.value(), self.selection_stop.value()])))
+        self.replay_region.blockSignals(False)
+
+    def _replay_region_changed(self):
+        start, stop = self.replay_region.getRegion()
+        mode = self.replay_time_axis.currentData()
+        if mode == "absolute" and self._replay_epoch() is not None:
+            start, stop = start - self._replay_epoch(), stop - self._replay_epoch()
+        elif mode == "samples":
+            start, stop = start / self.replay.sample_rate, stop / self.replay.sample_rate
+        for spin, value in ((self.selection_start, start), (self.selection_stop, stop)):
+            spin.blockSignals(True)
+            spin.setValue(value)
+            spin.blockSignals(False)
+
+    def _replay_selection(self):
+        if self.replay is None:
+            raise ValueError("请先打开一段记录")
+        channels = [ch.index for ch in self.replay.channels if self.replay_channel_checks[ch.index].isChecked()]
+        if not channels:
+            raise ValueError("请至少勾选一个通道")
+        start, stop = 0, self.replay.sample_count
+        if self.replay_select.isChecked():
+            start, stop = [self._replay_boundary(spin.value()) for spin in (self.selection_start, self.selection_stop)]
+        if stop <= start:
+            raise ValueError("所选区间至少需要一个样本，起点必须小于终点")
+        return start, stop, channels
 
     def draw_replay(self, *_):
         if self.replay is None:
             return
         raw, start, r = self._replay_window()
+        span = min(self.replay_seconds.value(), 200000 / r.sample_rate)
+        max_start = max(0, getattr(r, "elapsed_duration", r.duration) - span)
+        self.replay_start.blockSignals(True)
+        self.replay_start.setMaximum(max_start)
+        self.replay_start.blockSignals(False)
+        self.replay_slider.blockSignals(True)
+        self.replay_slider.setValue(round(self.replay_start.value() / max_start * 1000) if max_start else 0)
+        self.replay_slider.blockSignals(False)
         converted = convert_volts(raw, r.channels)
-        units = {c.unit for c in r.channels}
+        visible = [c for c in r.channels if self.replay_channel_checks[c.index].isChecked()]
+        units = {c.unit for c in visible}
         values = converted if len(units) == 1 else raw
         self.replay_plot.setLabel("left", "工程值" if len(units) == 1 else "原始电压", units=next(iter(units)) if len(units) == 1 else "V")
-        times = (start + np.arange(len(raw))) / r.sample_rate
+        times = self._replay_times(r, start, len(raw))
+        x = self._replay_x(times)
+        gaps = np.flatnonzero(np.diff(times) > 1.5 / r.sample_rate) + 1
+        plot_x = np.insert(x, gaps, x[gaps])
+        plot_values = np.insert(values, gaps, np.nan, axis=0)
         self.replay_plot.plotItem.legend.clear()
         for j, curve in enumerate(self.replay_curves):
-            if j < len(r.channels):
+            if j < len(r.channels) and self.replay_channel_checks[r.channels[j].index].isChecked():
                 curve.setPen(pg.mkPen(COLORS[r.channels[j].index], width=1.5))
-                curve.setData(times, values[:, j])
+                curve.setData(plot_x, plot_values[:, j], connect="finite")
                 self.replay_plot.plotItem.legend.addItem(curve, f"AI {r.channels[j].index} · {r.channels[j].name}")
             else:
                 curve.setData([], [])
         self.replay_plot.enableAutoRange()
-        self.replay_position.setText(f"{start / r.sample_rate:.2f} s")
+        columns = [j for j, c in enumerate(r.channels) if c in visible]
+        unit = next(iter(units)) if len(units) == 1 else "V"
+        self.replay_measurements.set_data(times, values[:, columns],
+                                          [(f"AI {c.index} · {c.name}", unit) for c in visible], x_values=x)
+        self._replay_selection_changed()
+        self.replay_position.setText(f"{self.replay_start.value():.6f} s")
         source = "原厂 HPF 文件" if self.replay_is_hpf else "协议模拟" if r.metadata.get("source") == "simulation" else str(r.metadata.get("source", "未知"))
         ending = (r.metadata.get("waveform_only_note") or "只读 HPF 波形") if self.replay_is_hpf else "异常中止：" + str(r.metadata.get("error")) if r.metadata.get("error") else "正常结束" if r.metadata.get("finalized") else "未正常关闭的记录"
+        if r.metadata.get("termination_reason") == "duration_complete":
+            ending = "定长记录完成"
+        elif r.metadata.get("termination_reason") == "end_of_file":
+            ending = "输入文件已到末尾"
+        elif r.metadata.get("termination_reason") == "user_stop" and not r.metadata.get("error"):
+            ending = "手动结束"
         if ((r.metadata.get("acquisition_config") or {}).get("input") or {}).get("loop"):
             ending += " · 循环输入含首尾拼接，不代表连续物理过程"
-        self.replay_info.setText(f"{self.replay_path.name}  ·  {source}  ·  {len(r.channels)} 路  ·  {r.sample_rate:,.3f} S/s  ·  {r.sample_count:,} 扫描  /  {r.sample_count/r.sample_rate:.2f} s\n{ending}")
+        options = r.metadata.get("recording_options", {})
+        notes = options.get("notes", "")
+        group = options.get("group_number", 0)
+        if group:
+            ending += f" · 第 {group:03d} 组"
+        elapsed = getattr(r, "elapsed_duration", r.duration)
+        if elapsed - r.duration > .5 / r.sample_rate:
+            ending += f" · 实录 {r.duration:.3f} s / 含暂停跨度 {elapsed:.3f} s"
+        if self.replay_time_axis.currentData() == "absolute" and self._replay_epoch() is not None:
+            ending += " · 电脑时钟起点 " + datetime.fromtimestamp(self._replay_epoch()).astimezone().isoformat(timespec="milliseconds")
+        self.replay_info.setText(f"{self.replay_path.name}  ·  {source}  ·  {len(r.channels)} 路  ·  {r.sample_rate:,.3f} S/s  ·  {r.sample_count:,} 扫描  /  {r.sample_count/r.sample_rate:.2f} s\n{ending}"
+                                 + (f"\n备注：{notes}" if notes else ""))
 
     def choose_hpf(self):
         path, _ = W.QFileDialog.getOpenFileName(self, "只读打开 QuickDAQ HPF", str(ROOT), "QuickDAQ 数据 (*.hpf)")
@@ -1134,21 +1585,37 @@ class MainWindow(W.QMainWindow):
         self.nav.setCurrentRow(1)
 
     def export_replay(self):
-        if self.replay_path is None:
-            self.tell("请先打开一段记录。")
-            return
-        suggested = self.replay_path.with_suffix(".csv") if self.replay_is_hpf else self.replay_path / "export.csv"
-        path, _ = W.QFileDialog.getSaveFileName(self, "导出原始电压与工程值", str(suggested), "CSV 数据 (*.csv)")
+        try:
+            start, stop, channels = self._replay_selection()
+            dialog = ExportDialog(self.replay, start, stop, channels, self)
+            if dialog.exec() == W.QDialog.DialogCode.Accepted:
+                self.tell(f"数据已导出 · {dialog.output_path}")
+        except (OSError, ValueError) as exc:
+            self.tell(f"导出失败：{exc}")
+
+    def show_replay_statistics(self):
+        try:
+            start, stop, channels = self._replay_selection()
+            StatisticsDialog(self.replay, start, stop, channels, self).exec()
+        except (OSError, ValueError) as exc:
+            self.tell(f"统计失败：{exc}")
+
+    def save_plot_image(self, plot):
+        path, _ = W.QFileDialog.getSaveFileName(self, "保存当前波形图", str(self.recording_root / "waveform.png"), "PNG 图像 (*.png)")
         if path:
             try:
-                if self.replay_is_hpf:
-                    from .hpf import export_hpf_csv
-                    export_hpf_csv(self.replay_path, Path(path), waveform_only=True)
-                else:
-                    export_csv(self.replay_path, Path(path))
-                self.tell(f"CSV 已导出 · {path}")
+                self.save_plot_image_to(plot, Path(path))
+                self.tell(f"波形图已保存 · {path}")
             except (OSError, ValueError) as exc:
-                self.tell(f"导出失败：{exc}")
+                self.tell(f"图像保存失败：{exc}")
+
+    @staticmethod
+    def save_plot_image_to(plot, path):
+        from pyqtgraph.exporters import ImageExporter
+        if Path(path).suffix.lower() != ".png":
+            raise ValueError("波形图请保存为 .png 文件")
+        exporter = ImageExporter(plot.plotItem)
+        exporter.export(str(path))
 
     def scan_devices(self):
         try:

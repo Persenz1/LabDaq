@@ -95,13 +95,15 @@ class RemoteEngine:
 
     @classmethod
     def start_new(cls, config, channels, signal_settings, experiment, recording_root,
-                  recording_path=None, *, endpoint=DEFAULT_ENDPOINT, source="simulation", connect_only=False):
+                  recording_path=None, *, endpoint=DEFAULT_ENDPOINT, source="simulation", connect_only=False,
+                  recording_options=None):
         client, state = CoreClient.connect_or_start(endpoint)
         if state["running"]:
             raise RuntimeError("核心已有采集会话，请重新打开界面接回，不能覆盖当前实验")
         profile = {"source": source, "config": asdict(config), "actual_rate": plan_clock(config.sample_rate).actual_rate,
                    "channels": [asdict(c) for c in channels], "signal_settings": signal_settings.to_dict(),
-                   "experiment": experiment, "recording_root": str(Path(recording_root).resolve())}
+                   "experiment": experiment, "recording_root": str(Path(recording_root).resolve()),
+                   "recording_options": recording_options or {}}
         if connect_only:
             state = client.request("connect", profile=profile)
         else:
@@ -165,12 +167,28 @@ class RemoteEngine:
         return self._state["recording"]
 
     @property
+    def recording_paused(self):
+        return self._state["recording_paused"]
+
+    @property
+    def acquisition_started_at_utc(self):
+        return self._state["acquisition_started_at_utc"]
+
+    @property
     def total_scans(self):
         return self._state["total_scans"]
 
     @property
     def recorded_scans(self):
         return self._state["recorded_scans"]
+
+    @property
+    def recording_target_scans(self):
+        return self._state["recording_target_scans"]
+
+    @property
+    def recording_remaining_scans(self):
+        return self._state["recording_remaining_scans"]
 
     @property
     def termination_reason(self):
@@ -190,16 +208,23 @@ class RemoteEngine:
             count = max(1, round(seconds * self.sample_rate))
             return self._times[-count:].copy(), self._raw[-count:].copy()
 
-    def start_recording(self, path, channels, experiment=""):
+    def start_recording(self, path, channels, experiment="", *, recording_options=None):
         # The GUI supplies all four physical channels; the core selects its map.
         self._call("start_recording", path=str(Path(path).resolve()),
-                   channels=[asdict(c) for c in channels], experiment=experiment)
+                   channels=[asdict(c) for c in channels], experiment=experiment,
+                   recording_options=recording_options or {})
 
     def set_channels(self, channels):
         self._call("set_channels", channels=[asdict(c) for c in channels])
 
     def stop_recording(self):
         self._call("stop_recording")
+
+    def pause_recording(self):
+        self._call("pause_recording")
+
+    def resume_recording(self):
+        self._call("resume_recording")
 
     def stop(self):
         self._call("stop")

@@ -14,7 +14,7 @@ import numpy as np
 
 from .protocol import AcquisitionConfig
 from .processing import ChannelSettings
-from .recording import SessionRecorder
+from .recording import SessionRecorder, _utc_now
 from .simulator import SimulatedTransport
 from .transport import DaqSession, TransportError
 
@@ -42,9 +42,12 @@ class AcquisitionEngine:
         self.error = ""
         self.termination_reason = "user_stop"
         self.running = False
+        self.acquisition_started_at_utc: str | None = None
         self.last_recording: Path | None = None
         self.recorded_scans = 0
+        self.recording_target_scans: int | None = None
         self._recorder: SessionRecorder | None = None
+        self._recording_paused = False
         self._lock = threading.Lock()
         self._record_lock = threading.Lock()
         self._stop = threading.Event()
@@ -55,15 +58,30 @@ class AcquisitionEngine:
         with self._record_lock:
             return self._recorder is not None
 
-    def start(self, recording_path: Path | None = None) -> None:
+    @property
+    def recording_paused(self) -> bool:
+        with self._record_lock:
+            return self._recording_paused
+
+    @property
+    def recording_remaining_scans(self) -> int | None:
+        with self._record_lock:
+            if self.recording_target_scans is None:
+                return None
+            return max(0, self.recording_target_scans - self.recorded_scans)
+
+    def start(self, recording_path: Path | None = None, *, recording_options=None,
+              experiment="") -> None:
         if self.running:
             return
         self.session.start()
+        self.acquisition_started_at_utc = _utc_now()
         self.running = True
         if recording_path is not None:
             try:
                 # Attach before the first read so a direct record includes sample 0.
-                self.start_recording(recording_path, self.channels)
+                self.start_recording(recording_path, self.channels,
+                                     recording_options=recording_options, experiment=experiment)
             except Exception:
                 self.running = False
                 self.session.close()
@@ -77,12 +95,22 @@ class AcquisitionEngine:
             while not self._stop.is_set():
                 volts = self.session.read(self.block_size)
                 if not len(volts):
-                    self.termination_reason = "end_of_file"
+                    with self._record_lock:
+                        if self._recorder is not None or self.termination_reason != "duration_complete":
+                            self.termination_reason = "end_of_file"
                     break
                 with self._record_lock:
-                    if self._recorder is not None:
-                        self._recorder.write(volts)
-                        self.recorded_scans += len(volts)
+                    if self._recorder is not None and not self._recording_paused:
+                        record_block = volts
+                        if self.recording_target_scans is not None:
+                            record_block = volts[:self.recording_target_scans - self.recorded_scans]
+                        self._recorder.write(record_block, source_start_scan=self._input_scans)
+                        self.recorded_scans += len(record_block)
+                        if self.recorded_scans == self.recording_target_scans:
+                            recorder, self._recorder = self._recorder, None
+                            self.termination_reason = "duration_complete"
+                            self._recording_paused = False
+                            recorder.close(termination_reason="duration_complete")
                     self._input_scans += len(volts)
                 with self._lock:
                     block = volts[-self.capacity:]
@@ -123,7 +151,8 @@ class AcquisitionEngine:
         times = np.arange(end_scan - n, end_scan, dtype=np.float64) / self.sample_rate
         return times, raw
 
-    def start_recording(self, path: Path, channels: list[ChannelSettings]) -> None:
+    def start_recording(self, path: Path, channels: list[ChannelSettings], *,
+                        recording_options=None, experiment="") -> None:
         with self._record_lock:
             if not self.running or self._stop.is_set():
                 raise RuntimeError("请先开始预览")
@@ -133,16 +162,39 @@ class AcquisitionEngine:
                 path, self.sample_rate, [replace(c) for c in channels], source=self.source,
                 acquisition_config={**asdict(self.config), "sample_rate": self.sample_rate,
                                     "input": self.input_metadata,
+                                    "acquisition_started_at_utc": self.acquisition_started_at_utc,
                                     "record_start_scan": self._input_scans},
+                recording_options=recording_options, experiment=experiment,
             )
             self.last_recording = Path(path)
             self.recorded_scans = 0
+            self._recording_paused = False
+            self.recording_target_scans = self._recorder.metadata["target_sample_count"]
+            self.termination_reason = "user_stop"
+
+    def pause_recording(self) -> None:
+        with self._record_lock:
+            if self._recorder is None:
+                raise RuntimeError("当前没有记录")
+            if not self._recording_paused:
+                self._recorder.set_paused(True)
+                self._recording_paused = True
+
+    def resume_recording(self) -> None:
+        with self._record_lock:
+            if self._recorder is None:
+                raise RuntimeError("当前没有记录")
+            if self._recording_paused:
+                self._recorder.set_paused(False, self._input_scans)
+                self._recording_paused = False
 
     def stop_recording(self, *, reason="user_stop") -> None:
         with self._record_lock:
             if self._recorder is not None:
                 recorder, self._recorder = self._recorder, None
-                recorder.close(termination_reason="error" if self.error else reason, error=self.error or None)
+                self._recording_paused = False
+                self.termination_reason = "error" if self.error else reason
+                recorder.close(termination_reason=self.termination_reason, error=self.error or None)
 
     def stop(self) -> None:
         self._stop.set()
