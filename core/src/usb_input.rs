@@ -67,7 +67,7 @@ pub struct DeviceInfo {
     pub channel_select: u16,
 }
 
-fn write(handle: &DeviceHandle<Context>, data: &[u8; 64]) -> Result<(), Fault> {
+pub(crate) fn write(handle: &DeviceHandle<Context>, data: &[u8; 64]) -> Result<(), Fault> {
     let n = handle
         .write_bulk(0x01, data, COMMAND_TIMEOUT)
         .map_err(|e| Fault::usb("发送设备命令", e))?;
@@ -99,7 +99,7 @@ fn read_word(handle: &DeviceHandle<Context>, address: u16) -> Result<u16, Fault>
     ))
 }
 
-fn modify(
+pub(crate) fn modify(
     handle: &DeviceHandle<Context>,
     address: u16,
     mask: u16,
@@ -126,6 +126,7 @@ pub struct UsbInput {
     workers: Vec<JoinHandle<()>>,
     powered: bool,
     started: bool,
+    pub output: crate::output::Output,
 }
 
 impl UsbInput {
@@ -165,7 +166,7 @@ impl UsbInput {
             .find(|i| i.interface_number() == 0 && i.setting_number() == 0)
             .ok_or_else(|| Fault::new("protocol_error", "未找到 USB 接口 0"))?;
         let endpoints: Vec<_> = interface.endpoint_descriptors().collect();
-        for address in [0x01, 0x81, 0x82, 0x88] {
+        for address in [0x01, 0x06, 0x81, 0x82, 0x88] {
             if !endpoints
                 .iter()
                 .any(|e| e.address() == address && e.transfer_type() == rusb::TransferType::Bulk)
@@ -220,12 +221,14 @@ impl UsbInput {
             workers: Vec::new(),
             powered: false,
             started: false,
+            output: crate::output::Output::new(),
         };
         let h = input.handle.as_ref().unwrap();
         input.powered = true; // Also attempt power-off if a power command completes only partially.
         write(h, &dt::packet(52, &[1]))?;
         thread::sleep(Duration::from_millis(100));
         write(h, &dt::subsystem(false))?;
+        input.output.stop(h)?;
         // Connecting powers the module without starting ADC transfers. Use
         // unexcited DC inputs while idle; apply the requested settings at start.
         modify(h, 2, 0x0f00, 0)?;
@@ -326,13 +329,14 @@ impl UsbInput {
         let message_handle = h.clone();
         let stopping = input.stopping.clone();
         let fault = input.fault.clone();
+        let output_active = input.output.active.clone();
         input.workers.push(thread::spawn(move || {
             let mut bytes = [0; 64];
             while !stopping.load(Ordering::Acquire) {
                 match message_handle.read_bulk(0x88, &mut bytes, READ_TIMEOUT) {
                     Err(rusb::Error::Timeout) | Ok(0) => {} // Idle status endpoint is normal.
                     Ok(n) => {
-                        if let Some(error) = message_fault(&bytes[..n]) {
+                        if let Some(error) = message_fault(&bytes[..n], output_active.load(Ordering::Acquire)) {
                             set_fault(&fault, error);
                             break;
                         }
@@ -375,6 +379,17 @@ impl UsbInput {
         self.fault.lock().unwrap().clone()
     }
 
+    pub fn start_output(&mut self, settings: crate::output::Settings) -> Result<(), Fault> {
+        if !self.started {
+            return Err(Fault::new("configuration_error", "请先开始真实 USB 预览，再启动 AO"));
+        }
+        self.output.start(self.handle.as_ref().unwrap(), settings, self.fault.clone())
+    }
+
+    pub fn stop_output(&mut self) -> Result<(), Fault> {
+        self.output.stop(self.handle.as_ref().ok_or_else(|| Fault::new("device_disconnected", "设备尚未连接"))?)
+    }
+
     pub fn check_connection(&self) -> Result<(), Fault> {
         let handle = self.handle.as_ref()
             .ok_or_else(|| Fault::new("device_disconnected", "设备尚未连接"))?;
@@ -384,8 +399,12 @@ impl UsbInput {
     pub fn stop(&mut self) -> Result<(), Fault> {
         let mut error = None;
         if let Some(h) = &self.handle {
+            if self.output.status.running || !self.output.status.zeroed {
+                error = self.output.stop(h).err();
+            }
             if self.started {
-                error = write(h, &dt::subsystem(false)).err();
+                let stop_error = write(h, &dt::subsystem(false)).err();
+                if error.is_none() { error = stop_error; }
                 self.started = false;
             }
             self.stopping.store(true, Ordering::Release);
@@ -421,7 +440,7 @@ impl Drop for UsbInput {
     }
 }
 
-fn message_fault(bytes: &[u8]) -> Option<Fault> {
+fn message_fault(bytes: &[u8], output_active: bool) -> Option<Fault> {
     if bytes.len() < 4 {
         return Some(Fault::new("protocol_error", "设备状态消息不足 4 字节"));
     }
@@ -433,6 +452,9 @@ fn message_fault(bytes: &[u8]) -> Option<Fault> {
         5 => Some(Fault::new(
             "device_overrun",
             "设备 ADC FIFO 溢出，数据连续性中断",
+        )),
+        6..=8 if output_active => Some(Fault::new(
+            "output_error", "设备报告 AO 欠载、过采样或意外结束，输入与输出已停止",
         )),
         1..=8 => None,
         code => Some(Fault::new(
@@ -448,15 +470,17 @@ mod tests {
     #[test]
     fn adc_errors_are_fatal_and_normal_notifications_are_not() {
         assert_eq!(
-            message_fault(&5u32.to_le_bytes()).unwrap().reason,
+            message_fault(&5u32.to_le_bytes(), false).unwrap().reason,
             "device_overrun"
         );
         assert_eq!(
-            message_fault(&4u32.to_le_bytes()).unwrap().reason,
+            message_fault(&4u32.to_le_bytes(), false).unwrap().reason,
             "adc_oversample"
         );
-        assert!(message_fault(&2u32.to_le_bytes()).is_none());
-        assert!(message_fault(&[5]).is_some());
-        assert!(message_fault(&99u32.to_le_bytes()).is_some());
+        assert!(message_fault(&2u32.to_le_bytes(), false).is_none());
+        assert!(message_fault(&[5], false).is_some());
+        assert!(message_fault(&99u32.to_le_bytes(), false).is_some());
+        assert!(message_fault(&6u32.to_le_bytes(), false).is_none());
+        assert_eq!(message_fault(&6u32.to_le_bytes(), true).unwrap().reason, "output_error");
     }
 }

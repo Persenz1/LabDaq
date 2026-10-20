@@ -23,6 +23,7 @@ from .core_client import DEFAULT_ENDPOINT, RemoteEngine
 from .inputs import HpfReplaySession
 from .signals import SimulationSettings
 from .input_dialog import SignalDialog
+from .output_panel import OutputPanel, DEFAULT_SETTINGS as DEFAULT_OUTPUT, validate_settings as validate_output
 from .processing import ChannelSettings, convert_volts, spectrum, frequency_response, filter_window
 from .protocol import AcquisitionConfig, plan_clock
 from .recording import load_session, next_recording_path
@@ -32,10 +33,11 @@ from .plot_measurements import PlotMeasurements
 from .transport import enumerate_usb_devices
 
 ROOT = Path(__file__).resolve().parents[1]
-NAV_TITLES = ["实时采集", "信号分析", "数据回看", "设备与协议"]
-NAV_ICONS = ["wave", "stats", "history", "chip"]
+NAV_TITLES = ["实时采集", "信号输出", "信号分析", "数据回看", "设备与协议"]
+NAV_ICONS = ["wave", "export", "stats", "history", "chip"]
 PAGE_SUBTITLES = [
     "连接设备，配置采集参数，实时查看多通道信号波形与数值。",
+    "设置 AO 波形与输出参数，控制信号输出和停止归零。",
     "从时间波形到频域，明确每一次分析的来源与单位。",
     "保留原始信号，让数据可以重新查看、分析和导出。",
     "查看设备描述符、协议命令和离线冷启动流程。",
@@ -246,6 +248,8 @@ class MainWindow(W.QMainWindow):
         self.active_channels = tuple(config.channels)
         self.ranges, self.coupling, self.iepe = list(config.ranges), list(config.coupling), list(config.iepe)
         self.signal_settings = SimulationSettings.from_dict(p["signal_settings"])
+        if self.engine.output.get("settings"):
+            self.output_panel.set_settings(self.engine.output["settings"])
         self._set_sample_rate(config.sample_rate)
         self.experiment.setText(p["experiment"])
         self._set_recording_options(p["recording_options"])
@@ -283,6 +287,7 @@ class MainWindow(W.QMainWindow):
         self.pages = W.QStackedWidget()
         self.pages.setObjectName("pages")
         self.pages.addWidget(self._live_page())
+        self.pages.addWidget(self._output_page())
         self.pages.addWidget(self._analysis_page())
         self.pages.addWidget(self._replay_page())
         self.pages.addWidget(self._device_page())
@@ -435,9 +440,9 @@ class MainWindow(W.QMainWindow):
         self.title.setText(NAV_TITLES[index])
         self.subtitle.setText(PAGE_SUBTITLES[index])
         self._update_mode_badge()
-        if index == 1:
+        if index == 2:
             self.refresh_analysis()
-        if index == 3:
+        if index == 4:
             self.refresh_protocol()
 
     # ------------------------------------------------------------------
@@ -565,6 +570,23 @@ class MainWindow(W.QMainWindow):
         column.addWidget(self._channel_section())
         column.addWidget(self._config_section())
         column.addStretch()
+        scroll.setWidget(content)
+        return scroll
+
+    def _output_page(self):
+        scroll = W.QScrollArea()
+        scroll.setObjectName("panelScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(W.QFrame.Shape.NoFrame)
+        content = W.QWidget()
+        content.setObjectName("pageHost")
+        layout = W.QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.output_panel = OutputPanel(self.start_output, self.stop_output)
+        self.output_panel.setFixedWidth(560)
+        self.output_panel.set_expanded(True)
+        layout.addWidget(self.output_panel, 0, QtCore.Qt.AlignmentFlag.AlignHCenter)
+        layout.addStretch()
         scroll.setWidget(content)
         return scroll
 
@@ -999,7 +1021,7 @@ class MainWindow(W.QMainWindow):
         fault_row.addWidget(label("故障注入只适用于正在运行的协议模拟输入。", "faint"))
         cl.addLayout(fault_row)
         layout.addWidget(comm_card, 1)
-        layout.addWidget(label("外部触发、模拟输出和多设备同步已有技术分析，本版界面尚未开放这些操作。",
+        layout.addWidget(label("左侧“信号输出”页面提供 AO 控制；外部触发和多设备同步尚未开放。",
                                "faint", True))
         return page
 
@@ -1136,7 +1158,7 @@ class MainWindow(W.QMainWindow):
 
     def _update_mode_badge(self):
         index = self.pages.currentIndex()
-        file_view = index == 2 or (index == 1 and self.analysis_source.currentIndex() == 1)
+        file_view = index == 3 or (index == 2 and self.analysis_source.currentIndex() == 1)
         if file_view and self.replay is not None:
             text = ("HPF 文件 · 离线回放" if self.replay_is_hpf else
                     "记录回放 · " + ("模拟数据" if self.replay.metadata.get("source") == "simulation" else "文件数据"))
@@ -1306,10 +1328,30 @@ class MainWindow(W.QMainWindow):
             if self.engine is not None:
                 self.engine.stop()
             connected = isinstance(self.engine, RemoteEngine) and self.engine.device_connected
-            self.tell("采集已停止，设备保持连接；点击“断开设备”可关闭工作电源。" if connected else
+            self.tell("采集与 AO 已停止，AO 已下发 0 V，设备保持连接。" if connected else
                       "采集已停止。已记录的数据可在“数据回看”中打开。")
         except Exception as exc:
             self.tell(f"停止采集：{exc}")
+        self._refresh_buttons()
+
+    def start_output(self):
+        try:
+            if not isinstance(self.engine, RemoteEngine) or self.engine.source != "usb" or not self.engine.running:
+                raise ValueError("请先开始真实 USB 预览")
+            self.engine.start_output(self.output_panel.settings())
+            self.tell("AO 已开始输出；可在 AI0 查看回环信号。关闭窗口后独立核心继续输出。")
+        except (OSError, ValueError, RuntimeError) as exc:
+            self.tell(f"无法开始 AO：{exc}")
+        self._refresh_buttons()
+
+    def stop_output(self):
+        try:
+            if not isinstance(self.engine, RemoteEngine):
+                return
+            self.engine.stop_output()
+            self.tell("AO 已停止并下发 0 V；输入预览和记录继续。")
+        except (OSError, ValueError, RuntimeError) as exc:
+            self.tell(f"AO 停止归零失败：{exc}")
         self._refresh_buttons()
 
     def toggle_record(self):
@@ -1338,6 +1380,9 @@ class MainWindow(W.QMainWindow):
         running = self.engine is not None and self.engine.running
         recording = self.engine is not None and self.engine.recording
         connected = isinstance(self.engine, RemoteEngine) and self.engine.device_connected
+        remote = isinstance(self.engine, RemoteEngine)
+        self.output_panel.update_state(connected and running, self.engine.output if remote else {},
+                                       bool(remote and self.engine.connection_error))
         self.device_button.setVisible(self.scenario.currentData() == "usb")
         self.device_button.setText("断开设备" if connected else "连接设备")
         self.device_button.setEnabled(not running)
@@ -1471,6 +1516,7 @@ class MainWindow(W.QMainWindow):
             self._connecting, self._device_error,
             (self.engine.device_connected, self.engine.connection_error)
             if isinstance(self.engine, RemoteEngine) else None,
+            json.dumps(self.engine.output, sort_keys=True) if isinstance(self.engine, RemoteEngine) else None,
         )
         if buttons_key != self._buttons_refresh_key:
             self._refresh_buttons()
@@ -1496,9 +1542,9 @@ class MainWindow(W.QMainWindow):
             return
         if page != 0:
             if self._tick % 30 == 0:
-                if page == 1:
+                if page == 2:
                     self.refresh_analysis()
-                elif page == 3:
+                elif page == 4:
                     self.refresh_protocol()
             return
         # A stopped input retains its last buffer. Only redraw when samples or
@@ -1794,13 +1840,17 @@ class MainWindow(W.QMainWindow):
     def save_profile(self):
         path, _ = W.QFileDialog.getSaveFileName(self, "保存实验配置", str(ROOT / "实验配置.json"), "JSON 配置 (*.json)")
         if path:
-            self.save_profile_to(Path(path))
+            try:
+                self.save_profile_to(Path(path))
+            except (ValueError, OSError) as exc:
+                self.tell(f"配置无法保存：{exc}")
 
     def save_profile_to(self, path: Path):
         data = {"schema": "labdaq-profile-v1", "channels": [asdict(c) for c in self.channels],
                 "active_channels": self.active_channels, "ranges": self.ranges, "coupling": self.coupling,
                 "iepe": self.iepe, "sample_rate": self.rate.currentData(), "scenario": self.scenario.currentData(),
                 "experiment": self.experiment.text(), "signal_settings": self.signal_settings.to_dict(),
+                "output_settings": self.output_panel.settings(),
                 "recording_options": self._recording_options(),
                 "display": {"live_time_axis": self.live_time_axis.currentData(),
                             "replay_time_axis": self.replay_time_axis.currentData(),
@@ -1832,6 +1882,8 @@ class MainWindow(W.QMainWindow):
         if self.scenario.findData(mode) < 0:
             raise ValueError("未知输入来源")
         settings = SimulationSettings.from_dict(data["signal_settings"]) if "signal_settings" in data else SimulationSettings()
+        output_settings = data.get("output_settings", DEFAULT_OUTPUT)
+        validate_output(output_settings)
         options = data.get("recording_options", {})
         duration = options.get("duration_seconds")
         if duration is not None and (not isinstance(duration, (int, float)) or isinstance(duration, bool)
@@ -1868,6 +1920,7 @@ class MainWindow(W.QMainWindow):
         self._discard_preview()
         self.channels, self.active_channels = channels, config.channels
         self.signal_settings = settings
+        self.output_panel.set_settings(output_settings)
         if reader is not None:
             self.input_hpf, self.input_hpf_config = reader, config
         self.ranges, self.coupling, self.iepe = list(config.ranges), list(config.coupling), list(config.iepe)
@@ -2054,7 +2107,7 @@ class MainWindow(W.QMainWindow):
             self.replay_start.blockSignals(False)
             self._time_axis_changed("replay")
             self._analysis_source_changed()
-            self.nav.setCurrentRow(2)
+            self.nav.setCurrentRow(3)
         except (OSError, ValueError, KeyError) as exc:
             self.tell(f"记录无法打开：{exc}")
 
@@ -2230,7 +2283,7 @@ class MainWindow(W.QMainWindow):
             return
         self.analysis_source.setCurrentIndex(1)
         self._analysis_source_changed()
-        self.nav.setCurrentRow(1)
+        self.nav.setCurrentRow(2)
 
     def export_replay(self):
         try:

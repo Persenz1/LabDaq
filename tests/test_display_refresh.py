@@ -89,7 +89,7 @@ def test_live_checkboxes_only_hide_curves_and_analysis_can_freeze(stopped_displa
     np.testing.assert_array_equal(window.live_curves[1].yData, raw[:, 1])
     np.testing.assert_array_equal(raw, original)
 
-    window.nav.setCurrentRow(1)
+    window.nav.setCurrentRow(2)
     window.analysis_mode.setCurrentIndex(3)
     np.testing.assert_array_equal(window.analysis_curve.xData, times)
     np.testing.assert_array_equal(window.analysis_curve.yData, raw[:, 0])
@@ -109,7 +109,7 @@ def test_hidden_live_page_skips_work_and_unfreezing_catches_up(stopped_display, 
     draw = Mock(wraps=window._draw_live)
     monkeypatch.setattr(window, "_draw_live", draw)
     window.refresh()
-    window.nav.setCurrentRow(2)
+    window.nav.setCurrentRow(3)
     engine.total_scans += 100
     engine.snapshot.return_value = times + .05, raw + .1
     window.refresh()

@@ -4,6 +4,7 @@
 
 # Local extraction / reading intermediates.
 /.work/
+/.task-tmp/
 /.runtime/
 /core/target/
 

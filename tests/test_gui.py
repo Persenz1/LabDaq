@@ -47,14 +47,14 @@ def test_chinese_workbench_record_analyze_replay(tmp_path):
         assert not window.engine.recording
         session = load_session(window.latest_recording)
         assert session.sample_count >= 800 and len(session.channels) == 3
-        window.nav.setCurrentRow(1)
+        window.nav.setCurrentRow(2)
         for index in range(3):
             window.analysis_mode.setCurrentIndex(index)
             window.refresh_analysis()
             assert not window.analysis_info.text().startswith("分析设置：")
         window.stop_button.click()
         window.open_last_recording()
-        assert window.pages.currentIndex() == 2
+        assert window.pages.currentIndex() == 3
         assert window.replay.sample_count == session.sample_count
         names = [text.text for _, text in window.replay_plot.plotItem.legend.items]
         assert names[-1].startswith("AI 3") and len(names) == 3
@@ -93,7 +93,7 @@ def test_official_hpf_and_cold_boot_offline_views(tmp_path):
         window.analysis_mode.setCurrentIndex(2)
         window.refresh_analysis()
         assert not window.analysis_info.text().startswith("分析设置：")
-        window.nav.setCurrentRow(3)
+        window.nav.setCurrentRow(4)
         window.simulate_boot()
         assert "1,105" in window.boot_result.text()
         assert "未访问硬件" in window.boot_result.text()

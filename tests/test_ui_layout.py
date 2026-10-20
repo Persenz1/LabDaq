@@ -29,14 +29,19 @@ def test_workbench_pages_and_command_bar_build_at_minimum_size(tmp_path):
     window.resize(1180, 780)
     window.show()
     try:
-        for row in range(4):
+        for row in range(5):
             window.nav.setCurrentRow(row)
             app.processEvents()
             assert window.pages.currentIndex() == row
-            assert window.title.text() == ["实时采集", "信号分析", "数据回看", "设备与协议"][row]
+            assert window.title.text() == ["实时采集", "信号输出", "信号分析", "数据回看", "设备与协议"][row]
+        window.nav.setCurrentRow(1)
+        app.processEvents()
+        assert window.output_panel.start_button.isVisible()
+        assert window.output_panel.stop_button.isVisible()
 
         window.nav.setCurrentRow(0)
         app.processEvents()
+        assert not window.output_panel.isVisible()
         assert window.preview_button.text() == "开始预览"
         assert window.record_button.text() == "开始记录"
         assert window.pause_record_button.text() == "暂停记录"
@@ -59,7 +64,7 @@ def test_workbench_pages_and_command_bar_build_at_minimum_size(tmp_path):
         assert not window.findChildren(W.QToolButton, "cardMenu")
 
         sections = [section for section in window.findChildren(CollapsibleSection)]
-        assert len(sections) == 3
+        assert len(sections) == 4
         storage = next(section for section in sections if section.toggle.text() == "配置与存储")
         assert not storage.body.isVisible()
         storage.set_expanded(True)

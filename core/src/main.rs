@@ -1,5 +1,6 @@
 //! Independent acquisition and recording. USB input uses no vendor runtime.
 mod dt9837;
+mod output;
 mod signal;
 mod usb_boot;
 mod usb_input;
@@ -274,6 +275,8 @@ enum Command {
     SetChannels {
         channels: [Channel; 4],
     },
+    StartOutput { settings: output::Settings },
+    StopOutput,
     StopRecording,
     PauseRecording,
     ResumeRecording,
@@ -352,6 +355,7 @@ impl State {
             "recording_paused": self.recording_paused,
             "acquisition_started_at_utc": self.acquisition_started_at_utc,
             "profile": self.profile, "device_connected": self.usb.is_some(),
+            "output": self.usb.as_ref().map(|u| &u.output.status),
             "total_scans": self.total_scans, "recorded_scans": self.recorded_scans,
             "recording_target_scans": self.recording_target_scans,
             "recording_remaining_scans": self.recording_remaining_scans,
@@ -377,13 +381,16 @@ impl State {
         }
         let p = self.profile.as_mut().unwrap();
         let target = p.recording_options.target_scans(p.actual_rate)?;
-        let recorder = Recorder::new(
+        let mut recorder = Recorder::new(
             path.clone(),
             p,
             self.total_scans,
             target,
             self.acquisition_started_at_utc.as_deref(),
         )?;
+        recorder.metadata["analog_output_at_start"] = json!(self.usb.as_ref().map(|u| &u.output.status));
+        recorder.metadata["analog_output_events"] = json!([]);
+        recorder.save_metadata()?;
         p.recording_root = path.parent().unwrap().to_path_buf();
         self.recorder = Some(recorder);
         self.last_recording = Some(path);
@@ -501,6 +508,21 @@ impl State {
                 self.start_recording(path)?;
             }
             Command::SetChannels { channels } => self.set_channels(channels)?,
+            Command::StartOutput { settings } => {
+                settings.validate()?;
+                let profile = self.profile.as_ref().ok_or("请先开始真实 USB 预览")?;
+                // AO → AI0 is the current loopback wiring; excitation must remain off.
+                if profile.config.iepe[0] {
+                    return Err("AO 回接 AI0 时必须关闭 AI0 的 IEPE；请停止采集后修改通道配置".into());
+                }
+                let usb = self.usb.as_mut().ok_or("AO 仅适用于真实 USB 设备")?;
+                usb.start_output(settings).map_err(|e| e.to_string())?;
+                self.record_output_event("start");
+            }
+            Command::StopOutput => {
+                self.usb.as_mut().ok_or("设备尚未连接")?.stop_output().map_err(|e| e.to_string())?;
+                self.record_output_event("stop");
+            }
             Command::PauseRecording => {
                 let recorder = self.recorder.as_mut().ok_or("当前没有记录")?;
                 if !self.recording_paused {
@@ -545,7 +567,17 @@ impl State {
         }
     }
 
+    fn record_output_event(&mut self, action: &str) {
+        if let Some(recorder) = &mut self.recorder {
+            recorder.metadata["analog_output_events"].as_array_mut().unwrap().push(json!({
+                "action": action, "requested_at_utc": utc_now(), "observed_input_scan": self.total_scans,
+                "output": self.usb.as_ref().map(|u| &u.output.status),
+            }));
+        }
+    }
+
     fn stop_input(&mut self, keep_connected: bool) {
+        self.record_output_event("acquisition_stop");
         self.running = false;
         if let Some(mut usb) = self.usb.take() {
             let mut healthy = true;

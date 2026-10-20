@@ -183,6 +183,10 @@ class RemoteEngine:
         return self._state["device_connected"]
 
     @property
+    def output(self):
+        return self._state.get("output") or {}
+
+    @property
     def recording(self):
         return self._state["recording"]
 
@@ -248,6 +252,12 @@ class RemoteEngine:
 
     def stop(self):
         self._call("stop")
+
+    def start_output(self, settings):
+        self._call("start_output", settings=settings)
+
+    def stop_output(self):
+        self._call("stop_output")
 
     def disconnect(self):
         self._call("disconnect")

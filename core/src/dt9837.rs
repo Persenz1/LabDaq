@@ -50,7 +50,18 @@ pub fn plan_clock(rate: f64) -> Result<ClockPlan, String> {
     if !(195.313..=105469.0).contains(&rate) {
         return Err("DT9837C 采样率需在 195.313–105469 Hz 之间".into());
     }
-    let high_speed = rate > 52734.0;
+    clock_plan(rate, false)
+}
+
+pub fn plan_output_clock(rate: f64) -> Result<ClockPlan, String> {
+    if !(10000.0..=96000.0).contains(&rate) {
+        return Err("AO 更新率需在 10000–96000 S/s 之间".into());
+    }
+    clock_plan(rate, true)
+}
+
+fn clock_plan(rate: f64, output: bool) -> Result<ClockPlan, String> {
+    let high_speed = !output && rate > 52734.0;
     let ticks = if high_speed { 256.0 } else { 512.0 };
     for (index, divider) in [2.0, 4.0, 8.0, 16.0].iter().enumerate() {
         let target = rate * ticks * divider / 1e6;
@@ -99,7 +110,7 @@ pub fn plan_clock(rate: f64) -> Result<ClockPlan, String> {
         };
         return Ok(ClockPlan {
             actual_rate: frequency * 1e6 / div_n as f64 / (ticks * divider),
-            divider_register: (index as u16) << 8,
+            divider_register: (index as u16) << if output { 10 } else { 8 },
             high_speed,
             registers: [
                 (0x0c, div_n as u8),
