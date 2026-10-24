@@ -115,7 +115,8 @@ def test_fixed_groups_inline_duration_profile_and_replay(tmp_path):
         window.duration_mode.setCurrentIndex(window.duration_mode.findData(30))
         assert window.recording_duration_seconds == 30
         window.live_seconds.setValue(20)
-        window._set_recording_options({"duration_seconds": .137, "notes": "加载 1 N\n模拟验证"})
+        window._set_recording_options({"duration_seconds": .137, "specimen": "试样 A-01",
+                                       "condition": "室温 · 加载 1 N", "notes": "加载 1 N\n模拟验证"})
         profile = tmp_path / "profile.json"
         window.save_profile_to(profile)
         window._set_recording_options({})
@@ -124,19 +125,25 @@ def test_fixed_groups_inline_duration_profile_and_replay(tmp_path):
         assert window.duration_mode.currentData() == "custom"
         assert window.duration_input.value() == .137
         assert window.live_seconds.value() == 20
-        assert "notes" not in window._recording_options()
+        assert window._recording_options() | {"group_number": 0} == {
+            "duration_seconds": .137, "specimen": "试样 A-01", "condition": "室温 · 加载 1 N",
+            "notes": "加载 1 N\n模拟验证", "group_number": 0}
         for group in (1, 2):
             window.toggle_record()
             path = window.latest_recording
             assert path.name.endswith(f"_顺序实验_{group:03d}")
             assert not window.duration_mode.isEnabled() and not window.duration_input.isEnabled()
+            assert not window.recording_notes.isEnabled()
             spin(app, lambda: not window.engine.recording and window.duration_mode.isEnabled())
             assert window.engine.running and window.duration_mode.isEnabled()
             recording = load_session(path)
             assert recording.sample_count == int(recording.sample_rate * .137 + .5)
             assert recording.metadata["recording_options"]["group_number"] == group
+            assert recording.metadata["recording_options"]["specimen"] == "试样 A-01"
+            assert recording.metadata["recording_options"]["condition"] == "室温 · 加载 1 N"
             window.open_replay(path)
-            assert recording.metadata["recording_options"]["notes"] == ""
+            assert recording.metadata["recording_options"]["notes"] == "加载 1 N\n模拟验证"
+            assert "试样 A-01" in window.replay_info.text()
             assert "定长记录完成" in window.replay_info.text()
     finally:
         window.close()

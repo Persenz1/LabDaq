@@ -179,8 +179,27 @@ def test_aborted_capture_preserves_first_termination_reason_and_error(tmp_path):
     assert session.sample_count == 2
 
 
+def test_metadata_replace_retries_transient_windows_sharing_violation(tmp_path, monkeypatch):
+    from pathlib import Path
+    original = Path.replace
+    attempts = []
+
+    def occasionally_locked(source, target):
+        attempts.append((source, target))
+        if len(attempts) < 3:
+            raise PermissionError(5, "模拟文件扫描器的短暂占用")
+        return original(source, target)
+
+    monkeypatch.setattr(Path, "replace", occasionally_locked)
+    with SessionRecorder(tmp_path / "session", 1000, [ChannelSettings(0, "力")]):
+        pass
+    assert len(attempts) == 4  # Two simulated locks, successful initialization and normal close.
+    assert load_session(tmp_path / "session").metadata["finalized"]
+
+
 def test_recording_preserves_experiment_notes_group_and_requested_duration(tmp_path):
-    options = {"duration_seconds": .123, "notes": "第二组，改变拉伸方向", "group_number": 2}
+    options = {"duration_seconds": .123, "specimen": "A-01", "condition": "室温",
+               "notes": "第二组，改变拉伸方向", "group_number": 2}
     with SessionRecorder(tmp_path / "session", 2000, [ChannelSettings(0, "力")],
                          recording_options=options, experiment="拖拽实验") as writer:
         options["notes"] = "changed after start"
@@ -188,14 +207,54 @@ def test_recording_preserves_experiment_notes_group_and_requested_duration(tmp_p
     metadata = load_session(tmp_path / "session").metadata
     assert metadata["experiment"] == "拖拽实验"
     assert metadata["recording_options"] == {
-        "duration_seconds": .123, "notes": "第二组，改变拉伸方向", "group_number": 2}
+        "duration_seconds": .123, "specimen": "A-01", "condition": "室温",
+        "notes": "第二组，改变拉伸方向", "group_number": 2}
+
+
+def test_update_recording_details_only_changes_descriptive_metadata(tmp_path):
+    from labdaq.recording import update_recording_details
+    path = tmp_path / "session"
+    with SessionRecorder(path, 100, [ChannelSettings(0, "力")], experiment="原实验",
+                         recording_options={"notes": "原始备注", "group_number": 3}) as writer:
+        writer.write([[.1], [.2]])
+    original = load_session(path)
+    raw_before = (path / "raw.f64").read_bytes()
+    updated = update_recording_details(path, experiment="新实验", specimen=" A-01 ",
+                                       condition=" 室温 ", notes="补充说明")
+    assert updated.metadata["experiment"] == "新实验"
+    assert updated.metadata["recording_options"] == {
+        "duration_seconds": None, "specimen": "A-01", "condition": "室温",
+        "notes": "补充说明", "group_number": 3}
+    assert updated.metadata["termination_reason"] == original.metadata["termination_reason"]
+    assert updated.metadata["sample_count"] == original.sample_count
+    assert updated.metadata["description_updated_at_utc"]
+    assert (path / "raw.f64").read_bytes() == raw_before
+    assert not (path / "metadata.json.tmp").exists()
+
+
+def test_update_recording_details_rejects_unfinished_or_invalid_input(tmp_path):
+    from labdaq.recording import update_recording_details
+    path = tmp_path / "active"
+    writer = SessionRecorder(path, 100, [ChannelSettings(0, "力")])
+    try:
+        with pytest.raises(ValueError, match="尚未正常收尾"):
+            update_recording_details(path, experiment="不能修改")
+    finally:
+        writer.close()
+    original = (path / "metadata.json").read_text(encoding="utf-8")
+    with pytest.raises(ValueError, match="不能为空"):
+        update_recording_details(path, experiment=" ")
+    with pytest.raises(ValueError, match="必须为文本"):
+        update_recording_details(path, experiment="实验", notes=None)
+    assert (path / "metadata.json").read_text(encoding="utf-8") == original
 
 
 def test_manual_recording_defaults_do_not_set_duration_target(tmp_path):
     with SessionRecorder(tmp_path / "manual", 2000, [ChannelSettings(0, "力")]):
         pass
     metadata = load_session(tmp_path / "manual").metadata
-    assert metadata["recording_options"] == {"duration_seconds": None, "notes": "", "group_number": 0}
+    assert metadata["recording_options"] == {"duration_seconds": None, "specimen": "",
+                                             "condition": "", "notes": "", "group_number": 0}
     assert metadata["target_sample_count"] is None
     assert metadata["experiment"] == ""
 
@@ -212,6 +271,7 @@ def test_recording_duration_rounds_half_samples_up(tmp_path, samples, expected):
     {"duration_seconds": float("inf")}, {"duration_seconds": 1e308},
     {"duration_seconds": "2"}, {"duration_seconds": True},
     {"group_number": -1}, {"group_number": 1.5}, {"notes": None},
+    {"specimen": None}, {"condition": []},
 ])
 def test_invalid_recording_options_do_not_create_directory(tmp_path, options):
     path = tmp_path / "invalid"

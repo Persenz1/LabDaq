@@ -74,10 +74,32 @@ def test_workbench_pages_and_command_bar_build_at_minimum_size(tmp_path):
 
         dialog = ChannelDialog(window)
         try:
-            assert dialog.table.columnCount() == 9
+            assert dialog.table.columnCount() == 12
             assert dialog.table.rowCount() == 4
-            assert dialog.table.columnWidth(6) >= 90  # range combo needs its width
+            assert dialog.table.columnWidth(9) >= 90  # range combo needs its width
+            assert dialog.table.columnWidth(3) >= 96
             assert dialog.table.cellWidget(0, 0).isChecked()
+            dialog.cells[0][0].setChecked(False)
+            dialog.bulk_unit.setCurrentText("Pa")
+            dialog.bulk_range.setCurrentText("±1 V")
+            dialog.bulk_coupling.setCurrentText("AC")
+            dialog.bulk_iepe.setCurrentText("开启")
+            dialog.bulk_button.click()
+            assert dialog.cells[0][4].currentText() == "N"
+            assert dialog.cells[0][9].currentText() == "±10 V"
+            assert all(row[4].currentText() == "Pa" for row in dialog.cells[1:])
+            assert all(row[9].currentText() == "±1 V" for row in dialog.cells[1:])
+            assert all(row[10].currentText() == "AC" for row in dialog.cells[1:])
+            assert all(row[11].isChecked() for row in dialog.cells[1:])
+            dialog.cells[0][0].setChecked(True)
+            dialog.cells[0][2].setValue(12)
+            dialog.cells[0][3].setCurrentText("X-")
+            dialog.cells[0][6].setValue(1.25)
+            dialog.apply()
+            assert window.channels[0].point_number == 12
+            assert window.channels[0].direction == "X-"
+            assert window.channels[0].engineering_offset == 1.25
+            assert window.active_channels == (0, 1, 2, 3)
         finally:
             dialog.close()
             dialog.deleteLater()

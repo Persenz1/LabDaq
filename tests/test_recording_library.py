@@ -13,10 +13,13 @@ from labdaq.recording import SessionRecorder
 from labdaq.recording_library import RecordingLibraryDialog, list_recordings
 
 
-def make_recording(root, name, started, *, notes="", reason="user_stop", finalized=True):
+def make_recording(root, name, started, *, notes="", specimen="", condition="",
+                   reason="user_stop", finalized=True):
     path = root / name
     writer = SessionRecorder(path, 4, [ChannelSettings(0, "力"), ChannelSettings(2, "位移")],
-                             experiment="拉伸试验", recording_options={"group_number": 2, "notes": notes})
+                             experiment="拉伸试验",
+                             recording_options={"group_number": 2, "notes": notes,
+                                                "specimen": specimen, "condition": condition})
     writer.write([[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]])
     writer.close(termination_reason=reason)
     metadata_path = path / "metadata.json"
@@ -79,6 +82,93 @@ def test_missing_recording_root_stays_missing(tmp_path):
     assert not root.exists()
 
 
+def test_library_edits_details_and_preserves_selection(tmp_path, monkeypatch):
+    from labdaq.recording import load_session
+    from labdaq.recording_library import RecordingDetailsDialog
+    app = W.QApplication.instance() or W.QApplication([])
+    first = make_recording(tmp_path, "first", "2026-10-18T00:00:00Z", specimen="A-01")
+    second = make_recording(tmp_path, "second", "2026-10-19T00:00:00Z")
+    unfinished = make_recording(tmp_path, "unfinished", None, finalized=False)
+    original_raw = (first / "raw.f64").read_bytes()
+
+    def apply_changes(editor):
+        editor.experiment.setText("修改后的实验")
+        editor.specimen.setText("B-02")
+        editor.condition.setText("50 °C")
+        editor.notes.setPlainText("第二次重复实验")
+        editor.accept()
+        return editor.result()
+
+    monkeypatch.setattr(RecordingDetailsDialog, "exec", apply_changes)
+    dialog = RecordingLibraryDialog(tmp_path)
+    changed = []
+    dialog.details_changed.connect(changed.append)
+    try:
+        first_row = next(row for row in range(dialog.table.rowCount())
+                         if dialog.table.item(row, 8).text() == first.name)
+        dialog.table.selectRow(first_row)
+        assert dialog.edit_button.isEnabled()
+        dialog.edit_button.click()
+        assert changed == [first]
+        assert (first / "raw.f64").read_bytes() == original_raw
+        metadata = load_session(first).metadata
+        assert metadata["experiment"] == "修改后的实验"
+        assert metadata["recording_options"]["specimen"] == "B-02"
+        assert metadata["recording_options"]["condition"] == "50 °C"
+        assert metadata["recording_options"]["notes"] == "第二次重复实验"
+        assert dialog._selected_entry().path == first
+        dialog.search.setText("B-02")
+        assert dialog._selected_entry().path == first
+        dialog.search.setText("50 °C")
+        assert dialog._selected_entry().path == first
+        dialog.search.clear()
+
+        flags = (QtCore.QItemSelectionModel.SelectionFlag.Select |
+                 QtCore.QItemSelectionModel.SelectionFlag.Rows)
+        dialog.table.clearSelection()
+        dialog.table.setCurrentCell(0, 0)
+        for row in range(2):
+            dialog.table.selectionModel().select(dialog.table.model().index(row, 0), flags)
+        assert {entry.path for entry in dialog._selected_entries()} == {first, second}
+        assert dialog.compare_button.isEnabled()
+        dialog.table.selectRow(next(row for row in range(dialog.table.rowCount())
+                                    if dialog.table.item(row, 8).text() == unfinished.name))
+        assert not dialog.compare_button.isEnabled()
+        assert not dialog.edit_button.isEnabled()
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.Type.DeferredDelete)
+        app.processEvents()
+
+
+def test_comparison_selection_allows_finalized_errors_only(tmp_path):
+    app = W.QApplication.instance() or W.QApplication([])
+    good = make_recording(tmp_path, "good", "2026-10-18T00:00:00Z")
+    abnormal = make_recording(tmp_path, "abnormal", "2026-10-19T00:00:00Z", reason="acquisition_error")
+    unfinished = make_recording(tmp_path, "unfinished", None, finalized=False)
+    dialog = RecordingLibraryDialog(tmp_path)
+    try:
+        flags = (QtCore.QItemSelectionModel.SelectionFlag.Select |
+                 QtCore.QItemSelectionModel.SelectionFlag.Rows)
+        dialog.table.setCurrentCell(0, 0)
+        for row in range(2):
+            dialog.table.selectionModel().select(dialog.table.model().index(row, 0), flags)
+        assert {entry.path for entry in dialog._selected_entries()} == {good, abnormal}
+        assert dialog.compare_button.isEnabled()
+        assert not dialog.batch_export_button.isEnabled()
+        assert "参与只读比较" in dialog.detail.text()
+        dialog.table.selectRow(next(row for row in range(dialog.table.rowCount())
+                                    if dialog.table.item(row, 8).text() == unfinished.name))
+        dialog.table.selectionModel().select(dialog.table.model().index(0, 0), flags)
+        assert not dialog.compare_button.isEnabled()
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.Type.DeferredDelete)
+        app.processEvents()
+
+
 def test_library_filters_sorts_selects_and_refreshes(recordings):
     app = W.QApplication.instance() or W.QApplication([])
     root, older, newest, interrupted, broken = recordings
@@ -86,7 +176,7 @@ def test_library_filters_sorts_selects_and_refreshes(recordings):
     try:
         assert dialog.selected_path is None and not dialog.open_button.isEnabled()
         assert dialog.table.rowCount() == 4
-        assert dialog.table.item(0, 7).text() == newest.name
+        assert dialog.table.item(0, 8).text() == newest.name
         assert dialog.table.item(0, 0).text() == datetime.fromisoformat(
             "2026-10-19T02:10:00+00:00").astimezone().strftime("%Y-%m-%d %H:%M:%S")
         assert dialog.table.editTriggers() == W.QAbstractItemView.EditTrigger.NoEditTriggers
@@ -99,15 +189,15 @@ def test_library_filters_sorts_selects_and_refreshes(recordings):
         assert not dialog.open_button.isEnabled()  # Hidden selection cannot be opened.
         dialog.search.clear()
         bad_row = next(row for row in range(dialog.table.rowCount())
-                       if dialog.table.item(row, 7).text() == broken.name)
+                       if dialog.table.item(row, 8).text() == broken.name)
         dialog.table.selectRow(bad_row)
         assert not dialog.open_button.isEnabled()
         assert "JSONDecodeError" in dialog.detail.text()
-        dialog.table.itemDoubleClicked.emit(dialog.table.item(bad_row, 7))
+        dialog.table.itemDoubleClicked.emit(dialog.table.item(bad_row, 8))
         assert dialog.selected_path is None
-        dialog.table.sortItems(7, QtCore.Qt.SortOrder.AscendingOrder)
+        dialog.table.sortItems(8, QtCore.Qt.SortOrder.AscendingOrder)
         selected_row = next(row for row in range(dialog.table.rowCount())
-                            if dialog.table.item(row, 7).text() == older.name)
+                            if dialog.table.item(row, 8).text() == older.name)
         dialog.table.selectRow(selected_row)
         dialog.open_button.click()
         assert dialog.selected_path == older
@@ -115,7 +205,7 @@ def test_library_filters_sorts_selects_and_refreshes(recordings):
         make_recording(root, "fresh", "2026-10-20T01:00:00Z")
         dialog.refresh_button.click()
         assert dialog.table.rowCount() == 5
-        assert dialog.table.item(0, 7).text() == "fresh"
+        assert dialog.table.item(0, 8).text() == "fresh"
         assert dialog.selected_path is None
     finally:
         dialog.close()

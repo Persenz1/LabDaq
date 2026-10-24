@@ -49,6 +49,12 @@ struct Channel {
     sensitivity_mv_per_unit: f64,
     zero_volts: f64,
     inverted: bool,
+    #[serde(default)]
+    point_number: Option<u32>,
+    #[serde(default)]
+    direction: String,
+    #[serde(default)]
+    engineering_offset: f64,
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -56,6 +62,8 @@ struct Channel {
 struct RecordingOptions {
     duration_seconds: Option<f64>,
     notes: String,
+    specimen: String,
+    condition: String,
     group_number: u64,
 }
 
@@ -99,11 +107,11 @@ impl Profile {
             || c.channels.windows(2).any(|w| w[0] >= w[1])
             || c.ranges.iter().any(|r| *r != 1.0 && *r != 10.0)
             || c.coupling.iter().any(|s| s != "AC" && s != "DC")
-            || self
-                .channels
-                .iter()
-                .enumerate()
-                .any(|(i, ch)| ch.index != i || ch.sensitivity_mv_per_unit <= 0.0)
+            || self.channels.iter().enumerate().any(|(i, ch)| {
+                ch.index != i
+                    || ch.sensitivity_mv_per_unit <= 0.0
+                    || !ch.engineering_offset.is_finite()
+            })
         {
             return Err("采样率、通道或换算配置无效".into());
         }
@@ -835,6 +843,9 @@ mod tests {
                 sensitivity_mv_per_unit: 1000.0,
                 zero_volts: 0.0,
                 inverted: false,
+                point_number: None,
+                direction: String::new(),
+                engineering_offset: 0.0,
             }),
             signal_settings: signal::Signals {
                 channels: std::array::from_fn(|_| signal::Signal {
@@ -931,6 +942,8 @@ mod tests {
         p.recording_options = RecordingOptions {
             duration_seconds: Some(0.003),
             notes: "定长备注".into(),
+            specimen: "试样 A".into(),
+            condition: "室温 · 10 Hz".into(),
             group_number: 1,
         };
         let mut state = State::new();
@@ -957,6 +970,8 @@ mod tests {
         assert_eq!(info["sample_count"], 6);
         assert_eq!(info["target_sample_count"], 6);
         assert_eq!(info["recording_options"]["notes"], "定长备注");
+        assert_eq!(info["recording_options"]["specimen"], "试样 A");
+        assert_eq!(info["recording_options"]["condition"], "室温 · 10 Hz");
         assert_eq!(info["recording_options"]["group_number"], 1);
         assert_eq!(info["recording_options"]["duration_seconds"], 0.003);
         assert_eq!(
@@ -999,6 +1014,8 @@ mod tests {
                 recording_options: RecordingOptions {
                     duration_seconds: Some(0.0025),
                     notes: "第二组".into(),
+                    specimen: String::new(),
+                    condition: String::new(),
                     group_number: 2,
                 },
             })

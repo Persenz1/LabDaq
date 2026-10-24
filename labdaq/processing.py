@@ -18,13 +18,16 @@ class ChannelSettings:
     sensitivity_mv_per_unit: float = 10.0
     zero_volts: float = 0.0
     inverted: bool = False
+    point_number: int | None = None
+    direction: str = ""
+    engineering_offset: float = 0.0
 
 
 def convert_volts(volts2d, channels):
     """Convert raw V into selected engineering units, preserving the input.
 
-    For physical units: value = (V - zero_V) / (sensitivity_mV_per_unit / 1000).
-    A voltage channel (unit='V') bypasses sensitivity, but keeps zero and sign.
+    The engineering offset is added after zero, sensitivity and polarity. A
+    voltage channel (unit='V') bypasses sensitivity, but keeps the other steps.
     Sensitivity must be positive; use ``inverted`` for polarity instead.
     """
     volts = np.asarray(volts2d, dtype=np.float64)
@@ -39,6 +42,9 @@ def convert_volts(volts2d, channels):
             result[:, column] *= 1000.0 / channel.sensitivity_mv_per_unit
         if channel.inverted:
             result[:, column] *= -1.0
+        if not np.isfinite(channel.engineering_offset):
+            raise ValueError("工程单位偏移必须是有限数")
+        result[:, column] += channel.engineering_offset
     return result
 
 

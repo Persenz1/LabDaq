@@ -16,12 +16,19 @@ def test_force_and_voltage_conversion_preserves_raw_and_uses_mv():
     raw = np.array([[0.12, 0.10, 2.0], [0.02, -0.10, -1.0]])
     snapshot = raw.copy()
     channels = [
-        ChannelSettings(0, "拉力", sensitivity_mv_per_unit=10, zero_volts=0.02),
-        ChannelSettings(2, "反向", sensitivity_mv_per_unit=20, inverted=True),
-        ChannelSettings(3, "电压", unit="V", sensitivity_mv_per_unit=0, zero_volts=0.5),
+        ChannelSettings(0, "拉力", sensitivity_mv_per_unit=10, zero_volts=0.02,
+                        engineering_offset=2.5, point_number=7, direction="X+"),
+        ChannelSettings(2, "反向", sensitivity_mv_per_unit=20, inverted=True, engineering_offset=-1.5),
+        ChannelSettings(3, "电压", unit="V", sensitivity_mv_per_unit=0, zero_volts=0.5,
+                        engineering_offset=.25),
     ]
-    np.testing.assert_allclose(convert_volts(raw, channels), [[10, -5, 1.5], [0, 5, -1.5]])
+    np.testing.assert_allclose(convert_volts(raw, channels), [[12.5, -6.5, 1.75], [2.5, 3.5, -1.25]])
     np.testing.assert_array_equal(raw, snapshot)
+
+
+def test_engineering_offset_must_be_finite():
+    with pytest.raises(ValueError, match="工程单位偏移"):
+        convert_volts([[1.0]], [ChannelSettings(0, "力", engineering_offset=float("nan"))])
 
 
 def test_zero_from_voltage_mean_removes_force_offset():

@@ -4,6 +4,7 @@ import csv
 import json
 import math
 import re
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from numbers import Integral, Real
@@ -32,6 +33,17 @@ def _task_progress(progress, cancelled, completed, total):
         raise OperationCancelled("操作已取消")
     if progress is not None:
         progress(completed, total)
+
+
+def _replace_metadata(temporary, target):
+    for attempt in range(5):
+        try:
+            temporary.replace(target)
+            return
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(.02)
 
 
 def next_recording_path(root, experiment, *, now=None) -> tuple[Path, int]:
@@ -64,9 +76,11 @@ class SessionRecorder:
         options = dict(recording_options or {})
         duration = options.get("duration_seconds")
         notes = options.get("notes", "")
+        specimen = options.get("specimen", "")
+        condition = options.get("condition", "")
         group = options.get("group_number", 0)
-        if not isinstance(notes, str) or not isinstance(experiment, str):
-            raise ValueError("实验名称和记录备注必须为文本")
+        if any(not isinstance(value, str) for value in (notes, specimen, condition, experiment)):
+            raise ValueError("实验名称、试样、工况和记录备注必须为文本")
         if isinstance(group, bool) or not isinstance(group, Integral) or group < 0:
             raise ValueError("记录组号必须为非负整数")
         target = None
@@ -79,7 +93,8 @@ class SessionRecorder:
                 raise ValueError("记录时长过大")
             target = max(1, math.floor(samples + 0.5))
             duration = float(duration)
-        options = {"duration_seconds": duration, "notes": notes, "group_number": int(group)}
+        options = {"duration_seconds": duration, "notes": notes, "specimen": specimen,
+                   "condition": condition, "group_number": int(group)}
         self.path = Path(path)
         self.path.mkdir(parents=True, exist_ok=False)
         self.channel_count = len(channels)
@@ -113,7 +128,7 @@ class SessionRecorder:
         temporary = self.path / "metadata.json.tmp"
         temporary.write_text(
             json.dumps(self.metadata, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(self.path / "metadata.json")
+        _replace_metadata(temporary, self.path / "metadata.json")
 
     def write(self, volts, source_start_scan=None):
         if self._file.closed:
@@ -181,6 +196,35 @@ class SessionRecorder:
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.close()
+
+
+def update_recording_details(path, *, experiment, specimen="", condition="", notes=""):
+    """Atomically edit descriptive fields without changing samples or acquisition history."""
+    if any(not isinstance(value, str) for value in (experiment, specimen, condition, notes)):
+        raise ValueError("实验名称、试样、工况和记录备注必须为文本")
+    if not experiment.strip():
+        raise ValueError("实验名称不能为空")
+    session = load_session(path)
+    if not session.metadata.get("finalized"):
+        raise ValueError("记录尚未正常收尾，不能编辑；请先结束活动记录")
+    path = session.path
+    metadata = dict(session.metadata)
+    options = dict(metadata.get("recording_options") or {})
+    options.update(notes=notes, specimen=specimen.strip(), condition=condition.strip())
+    metadata["experiment"] = experiment.strip()
+    metadata["recording_options"] = options
+    metadata["description_updated_at_utc"] = _utc_now()
+    temporary = path / "metadata.json.tmp"
+    try:
+        temporary.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+        _replace_metadata(temporary, path / "metadata.json")
+    finally:
+        temporary.unlink(missing_ok=True)
+    verified = load_session(path)
+    if (verified.metadata["experiment"] != metadata["experiment"]
+            or verified.metadata["recording_options"] != options):
+        raise RuntimeError("记录描述信息写入后校验失败")
+    return verified
 
 
 @dataclass

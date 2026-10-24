@@ -98,9 +98,9 @@ class ChannelDialog(W.QDialog):
     def __init__(self, window: "MainWindow"):
         super().__init__(window)
         self.setWindowTitle("通道与传感器配置")
-        self.resize(1180, 470)
+        self.resize(1380, 580)
+        self.setMinimumSize(1120, 560)
         self.window = window
-        p = theme.current()
         layout = W.QVBoxLayout(self)
         layout.setContentsMargins(22, 20, 22, 18)
         layout.setSpacing(12)
@@ -108,15 +108,16 @@ class ChannelDialog(W.QDialog):
         layout.addWidget(label("当前 10 mV/N 为演示灵敏度。实际测量请填写传感器与调理器的换算参数；"
                                "原始电压始终保留。", "notice", True))
         table_card, tl = card(margins=(10, 10, 10, 10), spacing=8)
-        self.table = W.QTableWidget(4, 9)
-        self.table.setHorizontalHeaderLabels(["启用", "通道名称", "单位", "mV / 单位", "零点 / V",
-                                              "反向", "量程", "耦合", "IEPE"])
+        self.table = W.QTableWidget(4, 12)
+        self.table.setHorizontalHeaderLabels(
+            ["启用", "通道名称", "测点号", "方向", "单位", "mV / 单位", "工程偏移",
+             "零点 / V", "反向", "量程", "耦合", "IEPE"])
         self.table.verticalHeader().setVisible(False)
         self.table.setShowGrid(False)
         self.table.setAlternatingRowColors(True)
         self.table.horizontalHeader().setSectionResizeMode(W.QHeaderView.ResizeMode.Interactive)
         self.table.horizontalHeader().setSectionResizeMode(1, W.QHeaderView.ResizeMode.Stretch)
-        for column, width in enumerate((66, 290, 86, 118, 106, 62, 104, 92, 100)):
+        for column, width in enumerate((70, 180, 85, 100, 86, 110, 125, 110, 62, 100, 90, 100)):
             self.table.setColumnWidth(column, width)
         self.table.setFixedHeight(4 * 48 + 40)
         self.cells = []
@@ -124,6 +125,14 @@ class ChannelDialog(W.QDialog):
             enabled = W.QCheckBox(f"AI {i}")
             enabled.setChecked(i in window.active_channels)
             name = W.QLineEdit(settings.name)
+            point = W.QSpinBox()
+            point.setRange(0, 999999)
+            point.setSpecialValueText("未设置")
+            point.setValue(settings.point_number or 0)
+            direction = W.QComboBox()
+            direction.setEditable(True)
+            direction.addItems(["", "X+", "X-", "Y+", "Y-", "Z+", "Z-"])
+            direction.setCurrentText(settings.direction)
             unit = W.QComboBox()
             unit.setEditable(True)
             unit.addItems(["N", "V", "Pa", "g", "mm", "°C"])
@@ -132,6 +141,11 @@ class ChannelDialog(W.QDialog):
             sensitivity.setRange(0.000001, 1e6)
             sensitivity.setDecimals(6)
             sensitivity.setValue(settings.sensitivity_mv_per_unit)
+            engineering_offset = W.QDoubleSpinBox()
+            engineering_offset.setRange(-1e12, 1e12)
+            engineering_offset.setDecimals(9)
+            engineering_offset.setValue(settings.engineering_offset)
+            engineering_offset.setToolTip("在灵敏度、零点和极性处理后，以当前通道单位加到此显示/导出值。")
             zero = W.QDoubleSpinBox()
             zero.setRange(-10, 10)
             zero.setDecimals(6)
@@ -148,15 +162,36 @@ class ChannelDialog(W.QDialog):
             iepe = W.QCheckBox("2 mA")
             iepe.setChecked(window.iepe[i])
             iepe.setToolTip("模拟器验证激励设置的寄存器命令，不模拟传感器的供电与电气响应。")
-            row = (enabled, name, unit, sensitivity, zero, inverted, ranges, coupling, iepe)
+            row = (enabled, name, point, direction, unit, sensitivity, engineering_offset,
+                   zero, inverted, ranges, coupling, iepe)
             self.cells.append(row)
             for j, widget in enumerate(row):
                 self.table.setCellWidget(i, j, widget)
             self.table.setRowHeight(i, 48)
         tl.addWidget(self.table)
         layout.addWidget(table_card)
-        layout.addWidget(label("换算：工程值 = 1000 × (原始电压[V] − 零点[V]) ÷ 灵敏度[mV/单位]。"
-                               "单位为 V 时不使用灵敏度。", "muted", True))
+        bulk_card, bulk_layout = card(margins=(14, 10, 14, 11), spacing=7)
+        bulk_layout.addWidget(field_label("批量设置（作用于全部启用通道，应用设置后生效）"))
+        bulk_row = W.QHBoxLayout()
+        bulk_row.setSpacing(9)
+        self.bulk_unit = W.QComboBox()
+        self.bulk_unit.setEditable(True)
+        self.bulk_unit.addItems(["不修改", "N", "V", "Pa", "g", "mm", "°C"])
+        self.bulk_range = W.QComboBox()
+        self.bulk_range.addItems(["不修改", "±10 V", "±1 V"])
+        self.bulk_coupling = W.QComboBox()
+        self.bulk_coupling.addItems(["不修改", "DC", "AC"])
+        self.bulk_iepe = W.QComboBox()
+        self.bulk_iepe.addItems(["不修改", "开启", "关闭"])
+        for title, widget in (("单位", self.bulk_unit), ("量程", self.bulk_range),
+                              ("耦合", self.bulk_coupling), ("IEPE", self.bulk_iepe)):
+            bulk_row.addWidget(field(title, widget), 1)
+        self.bulk_button = button("应用到启用通道", self.apply_bulk, "ghost")
+        bulk_row.addWidget(self.bulk_button, 0, QtCore.Qt.AlignmentFlag.AlignBottom)
+        bulk_layout.addLayout(bulk_row)
+        layout.addWidget(bulk_card)
+        layout.addWidget(label("换算：先扣零点、按灵敏度换算并应用极性，再加工程单位偏移。"
+                               "单位为 V 时不使用灵敏度；工程偏移不是仪器校准。", "muted", True))
         buttons = W.QDialogButtonBox(W.QDialogButtonBox.StandardButton.Ok |
                                      W.QDialogButtonBox.StandardButton.Cancel)
         ok = buttons.button(W.QDialogButtonBox.StandardButton.Ok)
@@ -167,6 +202,22 @@ class ChannelDialog(W.QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+    def apply_bulk(self):
+        rows = [row for row in self.cells if row[0].isChecked()]
+        if not rows:
+            W.QMessageBox.information(self, "批量通道设置", "请先勾选至少一个启用通道。")
+            return
+        for row in rows:
+            _, _, _, _, unit, _, _, _, _, ranges, coupling, iepe = row
+            if self.bulk_unit.currentText().strip() not in ("", "不修改"):
+                unit.setCurrentText(self.bulk_unit.currentText().strip())
+            if self.bulk_range.currentIndex():
+                ranges.setCurrentIndex(self.bulk_range.currentIndex() - 1)
+            if self.bulk_coupling.currentIndex():
+                coupling.setCurrentText(self.bulk_coupling.currentText())
+            if self.bulk_iepe.currentIndex():
+                iepe.setChecked(self.bulk_iepe.currentText() == "开启")
+
     def apply(self):
         active = tuple(i for i, row in enumerate(self.cells) if row[0].isChecked())
         if not active:
@@ -174,10 +225,13 @@ class ChannelDialog(W.QDialog):
             return
         w = self.window
         for i, row in enumerate(self.cells):
-            _, name, unit, sensitivity, zero, inverted, ranges, coupling, iepe = row
-            w.channels[i] = ChannelSettings(i, name.text().strip() or f"通道 {i}",
-                                            unit.currentText().strip() or "N",
-                                            sensitivity.value(), zero.value(), inverted.isChecked())
+            (_, name, point, direction, unit, sensitivity, engineering_offset,
+             zero, inverted, ranges, coupling, iepe) = row
+            w.channels[i] = ChannelSettings(
+                i, name.text().strip() or f"通道 {i}", unit.currentText().strip() or "N",
+                sensitivity.value(), zero.value(), inverted.isChecked(),
+                point_number=point.value() or None, direction=direction.currentText().strip(),
+                engineering_offset=engineering_offset.value())
             w.ranges[i] = 10.0 if ranges.currentIndex() == 0 else 1.0
             w.coupling[i] = coupling.currentText()
             w.iepe[i] = iepe.isChecked()
@@ -595,6 +649,17 @@ class MainWindow(W.QMainWindow):
         self.experiment = W.QLineEdit("力传感器实验")
         self.experiment.setToolTip("用于记录文件夹名称、自动分组编号和实验信息，不改变采样或传感器参数。")
         section.add(field("实验名称", self.experiment))
+        self.specimen = W.QLineEdit()
+        self.specimen.setPlaceholderText("例如：试样 A-01")
+        section.add(field("试样", self.specimen))
+        self.condition = W.QLineEdit()
+        self.condition.setPlaceholderText("例如：20 °C · 预载 5 N")
+        section.add(field("工况", self.condition))
+        self.recording_notes = W.QPlainTextEdit()
+        self.recording_notes.setPlaceholderText("本组目的、操作过程或异常说明（可选）")
+        self.recording_notes.setFixedHeight(64)
+        self.recording_notes.setTabChangesFocus(True)
+        section.add(field("本组备注", self.recording_notes))
         # Retain internal sources for tests and --demo; the acquisition panel is hardware-only.
         self.input_controls = W.QWidget(self)
         self.input_controls.hide()
@@ -1116,7 +1181,10 @@ class MainWindow(W.QMainWindow):
             card.title_label.setText(f"AI {i}")
             card.name_label.setText(c.name)
             card.unit_label.setText(c.unit)
-            self.channel_summary_names[i].setText(f"AI {i} · {c.name}")
+            annotation = (f"P{c.point_number} " if c.point_number is not None else "") + c.direction
+            card.name_label.setToolTip(annotation or c.name)
+            self.channel_summary_names[i].setText(
+                f"AI {i} · {c.name}" + (f" · {annotation}" if annotation else ""))
             self.channel_summary_meta[i].setText(f"{c.unit} · ±{self.ranges[i]:g} V")
             active = i in self.active_channels
             self.channel_summary_rows[i].setEnabled(active)
@@ -1413,15 +1481,16 @@ class MainWindow(W.QMainWindow):
                                          and self._previous_zero is not None)
         self.fault_button.setEnabled(running and self.engine.transport is not None)
         self.directory_button.setEnabled(not recording)
-        self.experiment.setEnabled(not recording)
-        self.duration_mode.setEnabled(not recording)
-        self.duration_input.setEnabled(not recording)
+        for widget in (self.experiment, self.specimen, self.condition, self.recording_notes,
+                       self.duration_mode, self.duration_input):
+            widget.setEnabled(not recording)
         ended = self.engine is not None and not self.engine.error and self.engine.termination_reason == "end_of_file"
         if isinstance(self.engine, RemoteEngine) and self.engine.connection_error:
             text, tone = "核心连接中断 · 状态未知", "danger"
             for widget in [self.preview_button, self.record_button, self.zero_button, self.scenario,
                            self.rate, self.channel_button, self.load_config_button, self.input_button,
-                           self.device_button, self.duration_mode, self.duration_input, self.undo_zero_button,
+                           self.device_button, self.experiment, self.specimen, self.condition,
+                           self.recording_notes, self.duration_mode, self.duration_input, self.undo_zero_button,
                            self.pause_record_button]:
                 widget.setEnabled(False)
         elif self._connecting:
@@ -1821,9 +1890,20 @@ class MainWindow(W.QMainWindow):
 
     def _recording_options(self, group_number=0):
         return {"duration_seconds": self.recording_duration_seconds,
+                "specimen": self.specimen.text().strip(),
+                "condition": self.condition.text().strip(),
+                "notes": self.recording_notes.toPlainText(),
                 "group_number": group_number}
 
     def _set_recording_options(self, options):
+        if not isinstance(options, dict):
+            raise ValueError("记录选项必须是 JSON 对象")
+        descriptive = {key: options.get(key, "") for key in ("specimen", "condition", "notes")}
+        if any(not isinstance(value, str) for value in descriptive.values()):
+            raise ValueError("试样、工况和记录备注必须为文本")
+        self.specimen.setText(descriptive["specimen"])
+        self.condition.setText(descriptive["condition"])
+        self.recording_notes.setPlainText(descriptive["notes"])
         duration = options.get("duration_seconds")
         with QtCore.QSignalBlocker(self.duration_mode), QtCore.QSignalBlocker(self.duration_input):
             index = self.duration_mode.findData(duration)
@@ -1878,6 +1958,16 @@ class MainWindow(W.QMainWindow):
         channels = [ChannelSettings(**c) for c in data["channels"]]
         if len(channels) != 4 or [c.index for c in channels] != list(range(4)):
             raise ValueError("配置必须包含 AI 0–3")
+        for channel in channels:
+            if (channel.point_number is not None and
+                    (type(channel.point_number) is not int or not 1 <= channel.point_number <= 999999)):
+                raise ValueError("测点号必须为 1–999999 的整数，或留空")
+            if not isinstance(channel.direction, str):
+                raise ValueError("通道方向必须为文本")
+            if (isinstance(channel.engineering_offset, bool)
+                    or not isinstance(channel.engineering_offset, (int, float))
+                    or not math.isfinite(channel.engineering_offset)):
+                raise ValueError("工程单位偏移必须是有限数")
         config = AcquisitionConfig(sample_rate=data["sample_rate"], channels=tuple(data["active_channels"]),
                                    ranges=tuple(data["ranges"]), coupling=tuple(data["coupling"]), iepe=tuple(data["iepe"]))
         mode = data["scenario"]
@@ -2057,8 +2147,33 @@ class MainWindow(W.QMainWindow):
 
     def open_recording_library(self):
         dialog = RecordingLibraryDialog(self.recording_root, self)
-        if dialog.exec() == W.QDialog.DialogCode.Accepted:
+        dialog.details_changed.connect(self._recording_details_changed)
+        result = dialog.exec()
+        if getattr(dialog, "comparison_paths", None):
+            self.open_comparison(dialog.comparison_paths)
+        elif result == W.QDialog.DialogCode.Accepted:
             self.open_replay(dialog.selected_path)
+
+    def open_comparison(self, paths):
+        from .comparison_dialog import ComparisonDialog
+        window = ComparisonDialog(paths)
+        window.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
+        windows = getattr(self, "_comparison_windows", [])
+        self._comparison_windows = windows
+        windows.append(window)
+        window.destroyed.connect(
+            lambda _=None, item=window: windows.remove(item) if item in windows else None)
+        window.show()
+        return window
+
+    def _recording_details_changed(self, path):
+        if self.replay is None or self.replay_is_hpf or Path(path) != self.replay_path:
+            return
+        try:
+            self.replay = load_session(path)
+            self.draw_replay()
+        except (OSError, ValueError, KeyError) as exc:
+            self.tell(f"记录信息更新后无法重新读取：{exc}")
 
     def open_last_recording(self):
         if self.latest_recording:
@@ -2266,8 +2381,17 @@ class MainWindow(W.QMainWindow):
             ending += f" · 实录 {r.duration:.3f} s / 含暂停跨度 {elapsed:.3f} s"
         if self.replay_time_axis.currentData() == "absolute" and self._replay_epoch() is not None:
             ending += " · 电脑时钟起点 " + datetime.fromtimestamp(self._replay_epoch()).astimezone().isoformat(timespec="milliseconds")
+        descriptive = " · ".join(f"{title}：{options[key]}" for title, key in
+                                (("试样", "specimen"), ("工况", "condition")) if options.get(key))
+        channel_details = []
+        for channel in r.channels:
+            annotation = (f"P{channel.point_number} " if channel.point_number is not None else "") + channel.direction
+            channel_details.append(f"AI {channel.index} {channel.name}"
+                                   + (f"（{annotation}）" if annotation else ""))
         self.replay_info.setText(f"{self.replay_path.name}  ·  {source}  ·  {len(r.channels)} 路  ·  {r.sample_rate:,.3f} S/s  ·  {r.sample_count:,} 扫描  /  {r.sample_count/r.sample_rate:.2f} s\n{ending}"
-                                 + (f"\n备注：{notes}" if notes else ""))
+                                 + (f"\n{descriptive}" if descriptive else "")
+                                 + (f"\n备注：{notes}" if notes else "")
+                                 + "\n通道：" + "；".join(channel_details))
 
     def choose_hpf(self):
         path, _ = W.QFileDialog.getOpenFileName(self, "只读打开 QuickDAQ HPF", str(ROOT), "QuickDAQ 数据 (*.hpf)")

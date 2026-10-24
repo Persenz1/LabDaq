@@ -230,7 +230,7 @@ def test_library_multiple_selection_keeps_open_current_and_disables_invalid_batc
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
     dialog = RecordingLibraryDialog(tmp_path)
     try:
-        rows = {dialog.table.item(row, 7).text(): row for row in range(dialog.table.rowCount())}
+        rows = {dialog.table.item(row, 8).text(): row for row in range(dialog.table.rowCount())}
         selection = dialog.table.selectionModel()
         flags = QtCore.QItemSelectionModel.SelectionFlag.Select | QtCore.QItemSelectionModel.SelectionFlag.Rows
         for source in (first, second):
