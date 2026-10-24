@@ -44,9 +44,38 @@ def recordings(tmp_path):
     broken = tmp_path / "损坏记录"
     broken.mkdir()
     (broken / "metadata.json").write_text("{ broken", encoding="utf-8")
-    # A nested session must not become a second search root.
-    make_recording(tmp_path / "archive", "nested", "2026-10-20T02:00:00Z")
+    # Sessions below the single experiment level are not discovered recursively.
+    make_recording(tmp_path / "archive" / "deeper", "nested", "2026-10-20T02:00:00Z")
     return tmp_path, older, newest, interrupted, broken
+
+
+def test_list_discovers_native_sessions_and_uses_relative_directory_names(tmp_path):
+    legacy = make_recording(tmp_path, "工况-001", "2026-10-18T00:00:00Z")
+    native = make_recording(tmp_path / "拉伸实验", "工况-001", "2026-10-19T00:00:00Z")
+    make_recording(tmp_path / "拉伸实验" / "归档", "工况-002", "2026-10-20T00:00:00Z")
+
+    entries = list_recordings(tmp_path)
+    assert {entry.path for entry in entries} == {legacy, native}
+    by_path = {entry.path: entry for entry in entries}
+    assert by_path[legacy].directory_name == "工况-001"
+    assert by_path[native].directory_name == "拉伸实验/工况-001"
+    assert by_path[native].matches("拉伸实验/工况")
+    assert not by_path[legacy].matches("拉伸实验")
+
+    app = W.QApplication.instance() or W.QApplication([])
+    dialog = RecordingLibraryDialog(tmp_path)
+    try:
+        assert {dialog.table.item(row, 8).text() for row in range(dialog.table.rowCount())} == {
+            "工况-001", "拉伸实验/工况-001"}
+        dialog.search.setText("拉伸实验/工况-001")
+        visible = [row for row in range(dialog.table.rowCount()) if not dialog.table.isRowHidden(row)]
+        assert len(visible) == 1
+        assert dialog.table.item(visible[0], 8).text() == "拉伸实验/工况-001"
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.Type.DeferredDelete)
+        app.processEvents()
 
 
 def test_list_records_metadata_without_reading_voltage(recordings, monkeypatch):

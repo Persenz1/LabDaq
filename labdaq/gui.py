@@ -7,7 +7,6 @@ import argparse
 import json
 import math
 from pathlib import Path
-import shutil
 import sys
 
 import numpy as np
@@ -15,7 +14,7 @@ import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets as W
 
 from . import theme
-from .ui_kit import (CollapsibleSection, MetricCard, card, chip_button, divider,
+from .ui_kit import (CollapsibleSection, METRIC_VALUE_MODES, MetricCard, card, chip_button, divider,
                      field, field_label, label, legend_chip, section_title,
                      status_chip, status_dot)
 from .engine import AcquisitionEngine
@@ -26,7 +25,7 @@ from .input_dialog import SignalDialog
 from .output_panel import OutputPanel, DEFAULT_SETTINGS as DEFAULT_OUTPUT, validate_settings as validate_output
 from .processing import ChannelSettings, convert_volts, spectrum, frequency_response, filter_window
 from .protocol import AcquisitionConfig, plan_clock
-from .recording import load_session, next_recording_path
+from .recording import load_session, next_recording_path, recording_directory
 from .data_dialog import ExportDialog, StatisticsDialog
 from .recording_library import RecordingLibraryDialog
 from .plot_measurements import PlotMeasurements
@@ -42,6 +41,11 @@ PAGE_SUBTITLES = [
     "保留原始信号，让数据可以重新查看、分析和导出。",
     "查看设备描述符、协议命令和离线冷启动流程。",
 ]
+
+
+class NoWheelComboBox(W.QComboBox):
+    def wheelEvent(self, event):
+        event.ignore()
 
 
 def button(text: str, callback=None, name="") -> W.QPushButton:
@@ -261,6 +265,7 @@ class MainWindow(W.QMainWindow):
         self.core_endpoint = core_endpoint
         self.recording_root = ROOT / "recordings"
         self.latest_recording: Path | None = None
+        self._pending_record: Path | None = None
         self.recording_duration_seconds: float | None = None
         self._completion_shown: Path | None = None
         self._previous_zero: list[float] | None = None
@@ -305,12 +310,14 @@ class MainWindow(W.QMainWindow):
         if self.engine.output.get("settings"):
             self.output_panel.set_settings(self.engine.output["settings"])
         self._set_sample_rate(config.sample_rate)
+        self.recording_root = Path(p["recording_root"])
         self.experiment.setText(p["experiment"])
         self._set_recording_options(p["recording_options"])
-        self.recording_root = Path(p["recording_root"])
-        self.directory_label.setText(str(self.recording_root))
-        self.directory_label.setToolTip(str(self.recording_root))
+        self._refresh_recording_directory()
         self.latest_recording = self.engine.last_recording
+        self._pending_record = self.latest_recording if self.engine.recording else None
+        group = p["recording_options"].get("group_number", 0)
+        self.recording_sequence.setValue(group if self.engine.recording else group + 1)
         # Reconnect is read-only: changing the input selector must not stop the core.
         self.scenario.blockSignals(True)
         self.scenario.setCurrentIndex(self.scenario.findData("usb" if self.engine.source == "usb" else "rust"))
@@ -382,6 +389,7 @@ class MainWindow(W.QMainWindow):
         self.nav.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
         for index, item in enumerate([self.nav.item(i) for i in range(self.nav.count())]):
             item.setIcon(theme.icon(NAV_ICONS[index], p.sidebar_icon, 18))
+            item.setHidden(index in (2, 4))
         sl.addWidget(self.nav)
         sl.addStretch()
         device = W.QFrame()
@@ -411,7 +419,7 @@ class MainWindow(W.QMainWindow):
         dl.addLayout(status_row)
         self.side_core_status = label("核心 · 未启动", "deviceMeta")
         dl.addWidget(self.side_core_status)
-        self.reconnect_button = chip_button("重新连接", "link", self.reconnect_device)
+        self.reconnect_button = chip_button("重新连接", "link", self.toggle_device_connection)
         self.reconnect_button.setFixedHeight(26)
         self.reconnect_button.setToolTip("重新连接数采并进入待机，不会开始采集或记录。")
         dl.addWidget(self.reconnect_button)
@@ -525,16 +533,19 @@ class MainWindow(W.QMainWindow):
         row.setSpacing(12)
         self.metric_cards = []
         self.live_channel_checks = []
+        self.metric_mode_combos = []
         self.metric_titles, self.metric_values, self.metric_subs = [], [], []
         for i in range(4):
             metric = MetricCard(f"AI {i}", self.p.channels[i])
             row.addWidget(metric)
             self.metric_cards.append(metric)
+            self.metric_mode_combos.append(metric.value_mode)
             self.metric_titles.append(metric.title_label)
             self.metric_values.append(metric.value_label)
             self.metric_subs.append(metric.sub_label)
             self.live_channel_checks.append(metric.visibility_button)
             metric.visibility_button.toggled.connect(self._live_visibility_changed)
+            metric.value_mode.currentIndexChanged.connect(self._metric_modes_changed)
         return row
 
     def _live_plot_card(self):
@@ -563,13 +574,6 @@ class MainWindow(W.QMainWindow):
         self.live_time_axis.currentIndexChanged.connect(lambda: self._time_axis_changed("live"))
         controls.addWidget(self.live_time_axis)
         controls.addSpacing(6)
-        controls.addWidget(field_label("读数"))
-        self.live_value_mode = W.QComboBox()
-        for title, mode in (("最新值", "last"), ("首值", "first"), ("均值", "mean"), ("最小值", "min"),
-                            ("最大值", "max"), ("RMS", "rms"), ("标准差", "std"), ("峰峰值", "delta")):
-            self.live_value_mode.addItem(title, mode)
-        controls.addWidget(self.live_value_mode)
-        controls.addSpacing(6)
         controls.addWidget(field_label("小数位"))
         self.value_decimals = W.QSpinBox()
         self.value_decimals.setRange(0, 9)
@@ -578,10 +582,10 @@ class MainWindow(W.QMainWindow):
         controls.addWidget(self.value_decimals)
         controls.addWidget(field_label("窗口"))
         self.live_seconds = W.QDoubleSpinBox()
-        self.live_seconds.setDecimals(1)
-        self.live_seconds.setRange(.1, 60)
+        self.live_seconds.setDecimals(3)
+        self.live_seconds.setRange(.001, 60)
         self.live_seconds.setValue(10)
-        self.live_seconds.setSingleStep(1)
+        self.live_seconds.setSingleStep(.001)
         self.live_seconds.setSuffix(" s")
         self.live_seconds.setFixedWidth(90)
         self.live_seconds.valueChanged.connect(self._live_window_changed)
@@ -622,7 +626,6 @@ class MainWindow(W.QMainWindow):
         column.setSpacing(12)
         column.addWidget(self._acquisition_section())
         column.addWidget(self._channel_section())
-        column.addWidget(self._config_section())
         column.addStretch()
         scroll.setWidget(content)
         return scroll
@@ -647,19 +650,30 @@ class MainWindow(W.QMainWindow):
     def _acquisition_section(self):
         section = CollapsibleSection("采集参数", "settings", expanded=True)
         self.experiment = W.QLineEdit("力传感器实验")
-        self.experiment.setToolTip("用于记录文件夹名称、自动分组编号和实验信息，不改变采样或传感器参数。")
+        self.experiment.setToolTip("在通用记录目录下以此名称创建实验子文件夹。")
+        self.experiment.textChanged.connect(self._refresh_recording_directory)
         section.add(field("实验名称", self.experiment))
-        self.specimen = W.QLineEdit()
-        self.specimen.setPlaceholderText("例如：试样 A-01")
-        section.add(field("试样", self.specimen))
+        condition_row = W.QWidget()
+        condition_layout = W.QHBoxLayout(condition_row)
+        condition_layout.setContentsMargins(0, 0, 0, 0)
+        condition_layout.setSpacing(6)
         self.condition = W.QLineEdit()
-        self.condition.setPlaceholderText("例如：20 °C · 预载 5 N")
-        section.add(field("工况", self.condition))
-        self.recording_notes = W.QPlainTextEdit()
-        self.recording_notes.setPlaceholderText("本组目的、操作过程或异常说明（可选）")
-        self.recording_notes.setFixedHeight(64)
-        self.recording_notes.setTabChangesFocus(True)
-        section.add(field("本组备注", self.recording_notes))
+        self.condition.setPlaceholderText("例如：正弦波；留空为未命名")
+        self.recording_sequence = W.QSpinBox()
+        self.recording_sequence.setRange(1, 999999999)
+        self.recording_sequence.setValue(1)
+        self.recording_sequence.setFixedWidth(68)
+        self.recording_sequence.setToolTip("每组记录正常收尾后自动加 1，也可手动修改。")
+        condition_layout.addWidget(self.condition, 1)
+        condition_layout.addWidget(field_label("–"))
+        condition_layout.addWidget(self.recording_sequence)
+        section.add(field("当前工况名称", condition_row))
+        self.directory_button = button("选择保存文件夹", self.choose_directory, "ghost")
+        self.directory_button.setIcon(theme.icon("folder", self.p.text_muted, 15))
+        self.directory_button.setIconSize(QtCore.QSize(15, 15))
+        section.add(self.directory_button)
+        self._refresh_recording_directory()
+        section.add(divider())
         # Retain internal sources for tests and --demo; the acquisition panel is hardware-only.
         self.input_controls = W.QWidget(self)
         self.input_controls.hide()
@@ -682,20 +696,16 @@ class MainWindow(W.QMainWindow):
         inputs.addWidget(self.hpf_loop)
         self.input_info = label("", "muted", True)
         inputs.addWidget(self.input_info)
-        self.rate = W.QComboBox()
+        self.rate = NoWheelComboBox()
         for rate in (500, 1000, 2000, 5000, 10000, 20000, 50000, 100000):
             self.rate.addItem(f"{rate / 1000:g} kS/s" + (" · 推荐" if rate == 5000 else ""), float(rate))
         self.rate.setCurrentIndex(self.rate.findData(5000.0))
         self.rate.currentIndexChanged.connect(self._update_live_window_limit)
-        self.rate.setToolTip("每通道同时采样。5 kS/s 为通用默认档；更高采样率适用于更快的信号，也会增加记录文件大小。")
+        self.rate.setToolTip("每通道同时采样。鼠标滚轮不会修改此选项；更高采样率会增加记录文件大小。")
         section.add(field("采样率 / 每通道", self.rate))
         self.actual_rate = label("实际时钟：开始后显示", "muted")
         self.actual_rate.setToolTip("此处显示 PLL 计算出的名义采样率；晶振误差和真实时序尚未测量。")
         section.add(self.actual_rate)
-        self.device_button = button("连接设备", self.toggle_device_connection, "ghost")
-        self.device_button.setIcon(theme.icon("link", self.p.text_muted, 15))
-        self.device_button.setIconSize(QtCore.QSize(15, 15))
-        section.add(self.device_button)
         return section
 
     def _channel_section(self):
@@ -722,33 +732,6 @@ class MainWindow(W.QMainWindow):
         self.channel_button.setIconSize(QtCore.QSize(15, 15))
         section.add(self.channel_button)
         section.add(label("波形区可统一调零或撤销调零；原始电压不变。", "faint", True))
-        return section
-
-    def _config_section(self):
-        section = CollapsibleSection("配置与存储", "folder", expanded=False)
-        buttons = W.QHBoxLayout()
-        buttons.setSpacing(8)
-        self.save_config_button = button("保存配置", self.save_profile, "ghost")
-        self.save_config_button.setIcon(theme.icon("save", self.p.text_muted, 15))
-        self.load_config_button = button("载入配置", self.load_profile, "ghost")
-        self.load_config_button.setIcon(theme.icon("open", self.p.text_muted, 15))
-        for widget in (self.save_config_button, self.load_config_button):
-            widget.setIconSize(QtCore.QSize(15, 15))
-        buttons.addWidget(self.save_config_button)
-        buttons.addWidget(self.load_config_button)
-        section.add_layout(buttons)
-        section.add(divider())
-        section.add(field_label("记录目录"))
-        self.directory_label = label(str(self.recording_root), "muted", True)
-        self.directory_label.setToolTip(str(self.recording_root))
-        section.add(self.directory_label)
-        self.disk_space_label = label("", "muted")
-        section.add(self.disk_space_label)
-        self._refresh_disk_space()
-        self.directory_button = button("更改目录", self.choose_directory, "ghost")
-        self.directory_button.setIcon(theme.icon("folder", self.p.text_muted, 15))
-        self.directory_button.setIconSize(QtCore.QSize(15, 15))
-        section.add(self.directory_button)
         return section
 
     def _transport_button(self, text, icon_name, color, name="", checkable=False):
@@ -1395,21 +1378,26 @@ class MainWindow(W.QMainWindow):
 
     def stop_acquisition(self):
         try:
+            recorded_path = self.latest_recording if self.engine is not None and self.engine.recording else None
             if self.engine is not None:
                 self.engine.stop()
-            connected = isinstance(self.engine, RemoteEngine) and self.engine.device_connected
-            self.tell("采集与 AO 已停止，AO 已下发 0 V，设备保持连接。" if connected else
-                      "采集已停止。已记录的数据可在“数据回看”中打开。")
+            if recorded_path is not None:
+                self._record_completed(recorded_path)
+            else:
+                connected = isinstance(self.engine, RemoteEngine) and self.engine.device_connected
+                self.tell("AI 采集已停止，AO 保持当前状态，设备保持连接。" if connected else
+                          "采集已停止。已记录的数据可在“数据回看”中打开。")
         except Exception as exc:
             self.tell(f"停止采集：{exc}")
         self._refresh_buttons()
 
     def start_output(self):
         try:
-            if not isinstance(self.engine, RemoteEngine) or self.engine.source != "usb" or not self.engine.running:
-                raise ValueError("请先开始真实 USB 预览")
+            if (not isinstance(self.engine, RemoteEngine) or self.engine.source != "usb"
+                    or not self.engine.device_connected):
+                raise ValueError("请先连接真实 USB 设备")
             self.engine.start_output(self.output_panel.settings())
-            self.tell("AO 已开始输出；可在 AI0 查看回环信号。关闭窗口后独立核心继续输出。")
+            self.tell("AO 已开始输出；AI 采集状态不变。需要回环读数时请单独开始预览。")
         except (OSError, ValueError, RuntimeError) as exc:
             self.tell(f"无法开始 AO：{exc}")
         self._refresh_buttons()
@@ -1419,7 +1407,7 @@ class MainWindow(W.QMainWindow):
             if not isinstance(self.engine, RemoteEngine):
                 return
             self.engine.stop_output()
-            self.tell("AO 已停止并下发 0 V；输入预览和记录继续。")
+            self.tell("AO 已停止并下发 0 V；AI 采集状态不变。")
         except (OSError, ValueError, RuntimeError) as exc:
             self.tell(f"AO 停止归零失败：{exc}")
         self._refresh_buttons()
@@ -1427,37 +1415,55 @@ class MainWindow(W.QMainWindow):
     def toggle_record(self):
         try:
             if self.engine is not None and self.engine.recording:
+                path = self.latest_recording
                 self.engine.stop_recording()
-                self.tell(f"记录已保存 · {self.latest_recording}")
+                self._record_completed(path)
             else:
-                path, group_number = next_recording_path(self.recording_root, self.experiment.text())
+                path, group_number = next_recording_path(
+                    self.recording_root, self.experiment.text(),
+                    self.condition.text(), self.recording_sequence.value())
+                if path.exists():
+                    raise FileExistsError(f"记录已存在，未覆盖：{path}；请修改工况名称或序号")
                 options = self._recording_options(group_number)
                 if self.engine is None or not self.engine.running:
                     self._begin_input(recording_path=path, recording_options=options)
-                    return
-                if isinstance(self.engine, RemoteEngine):
+                    if self.engine is None or not self.engine.recording or self.latest_recording != path:
+                        return
+                elif isinstance(self.engine, RemoteEngine):
                     self.engine.start_recording(path, self.channels, self.experiment.text(), recording_options=options)
                 else:
                     self.engine.start_recording(path, self._selected_settings(), recording_options=options,
                                                 experiment=self.experiment.text())
                 self.latest_recording = path
+                self._pending_record = path
                 self.tell(f"正在记录当前输入 · 原始电压、来源和换算参数保存在 {path}")
         except Exception as exc:
             self.tell(f"记录操作失败：{exc}")
         self._refresh_buttons()
+
+    def _record_completed(self, path):
+        if path is None:
+            return
+        self.latest_recording = path
+        self._completion_shown = path
+        if self._pending_record == path:
+            self._pending_record = None
+            self.recording_sequence.setValue(self.recording_sequence.value() + 1)
+        self.tell(f"记录已保存 · {path}", "success")
 
     def _refresh_buttons(self):
         running = self.engine is not None and self.engine.running
         recording = self.engine is not None and self.engine.recording
         connected = isinstance(self.engine, RemoteEngine) and self.engine.device_connected
         remote = isinstance(self.engine, RemoteEngine)
-        self.output_panel.update_state(connected and running, self.engine.output if remote else {},
+        ao_ready = connected and self.engine.source == "usb"
+        self.output_panel.update_state(ao_ready, self.engine.output if remote else {},
                                        bool(remote and self.engine.connection_error))
-        self.device_button.setVisible(self.scenario.currentData() == "usb")
-        self.device_button.setText("断开设备" if connected else "连接设备")
-        self.device_button.setEnabled(not running)
-        self.reconnect_button.setVisible(self.scenario.currentData() == "usb" and not connected)
+        self.reconnect_button.setVisible(self.scenario.currentData() == "usb")
+        self.reconnect_button.setText("断开设备" if connected else "重新连接")
         self.reconnect_button.setEnabled(not running and not self._connecting)
+        self.reconnect_button.setToolTip("停止采集后断开数采并关闭工作电源。" if connected else
+                                         "重新连接数采并进入待机，不会开始采集或记录。")
         from_hpf = self.scenario.currentData() == "hpf"
         hardware_ready = self.scenario.currentData() != "usb" or connected
         self.preview_button.setEnabled(not running and hardware_ready)
@@ -1472,7 +1478,7 @@ class MainWindow(W.QMainWindow):
         self.pause_record_button.setText("继续记录" if paused else "暂停记录")
         self.pause_record_button.setIcon(theme.icon("play" if paused else "pause",
                                                     self.p.text_muted, 16))
-        for widget in [self.scenario, self.load_config_button, self.input_button, self.hpf_loop]:
+        for widget in [self.scenario, self.input_button, self.hpf_loop]:
             widget.setEnabled(not running)
         self.rate.setEnabled(not running and not from_hpf)
         self.channel_button.setEnabled(not running and not from_hpf)
@@ -1481,16 +1487,16 @@ class MainWindow(W.QMainWindow):
                                          and self._previous_zero is not None)
         self.fault_button.setEnabled(running and self.engine.transport is not None)
         self.directory_button.setEnabled(not recording)
-        for widget in (self.experiment, self.specimen, self.condition, self.recording_notes,
+        for widget in (self.experiment, self.condition, self.recording_sequence,
                        self.duration_mode, self.duration_input):
             widget.setEnabled(not recording)
         ended = self.engine is not None and not self.engine.error and self.engine.termination_reason == "end_of_file"
         if isinstance(self.engine, RemoteEngine) and self.engine.connection_error:
             text, tone = "核心连接中断 · 状态未知", "danger"
             for widget in [self.preview_button, self.record_button, self.zero_button, self.scenario,
-                           self.rate, self.channel_button, self.load_config_button, self.input_button,
-                           self.device_button, self.experiment, self.specimen, self.condition,
-                           self.recording_notes, self.duration_mode, self.duration_input, self.undo_zero_button,
+                           self.rate, self.channel_button, self.input_button,
+                           self.experiment, self.condition, self.recording_sequence,
+                           self.duration_mode, self.duration_input, self.undo_zero_button,
                            self.pause_record_button]:
                 widget.setEnabled(False)
         elif self._connecting:
@@ -1520,8 +1526,8 @@ class MainWindow(W.QMainWindow):
         dot_color = theme.tone_color(self.p, tone)[0] if tone != "neutral" else self.p.text_faint
         self.status_dot_label.setPixmap(theme.dot_pixmap(dot_color, 8))
         if self._connecting:
-            for widget in (self.preview_button, self.record_button, self.device_button, self.reconnect_button,
-                           self.rate, self.channel_button, self.load_config_button, self.scenario):
+            for widget in (self.preview_button, self.record_button, self.reconnect_button,
+                           self.rate, self.channel_button, self.scenario):
                 widget.setEnabled(False)
         self._update_side_status()
         self._update_mode_badge()
@@ -1576,8 +1582,6 @@ class MainWindow(W.QMainWindow):
 
     def refresh(self):
         self._tick += 1
-        if self._tick % 300 == 0:
-            self._refresh_disk_space()
         if self.engine is None:
             return
         buttons_key = (
@@ -1606,8 +1610,7 @@ class MainWindow(W.QMainWindow):
                 self.tell(f"采集已中止：{self.engine.error}。已有记录已尝试关闭；可重新开始预览。")
         if (not self.engine.recording and self.engine.termination_reason == "duration_complete"
                 and self.engine.last_recording != self._completion_shown):
-            self._completion_shown = self.engine.last_recording
-            self.tell(f"本组定长记录已完成并保存 · {self.engine.last_recording}")
+            self._record_completed(self.engine.last_recording)
         page = self.pages.currentIndex()
         if self._preview_invalidated and page == 0:
             return
@@ -1623,7 +1626,7 @@ class MainWindow(W.QMainWindow):
         display_key = (
             self.engine, self.engine.total_scans, self.engine.recording,
             self.engine.recorded_scans, self.engine.recording_remaining_scans,
-            self.live_value_mode.currentData(), self.value_decimals.value(),
+            tuple(combo.currentData() for combo in self.metric_mode_combos), self.value_decimals.value(),
             self.live_time_axis.currentData(), self.live_seconds.value(), self.pause_plot.isChecked(),
             self.engine.display_revision if isinstance(self.engine, RemoteEngine) else None,
             tuple(check.isChecked() for check in self.live_channel_checks),
@@ -1638,9 +1641,8 @@ class MainWindow(W.QMainWindow):
         self._live_display_key = display_key
         converted = convert_volts(raw, self._selected_settings())
         for j, i in enumerate(self.active_channels):
-            c = self.channels[i]
             recent = converted[-min(len(raw), max(1, round(self.engine.sample_rate))):, j]
-            mode = self.live_value_mode.currentData()
+            mode = self.metric_mode_combos[i].currentData()
             value = {"last": lambda: recent[-1], "first": lambda: recent[0],
                      "mean": lambda: np.mean(recent), "min": lambda: np.min(recent),
                      "max": lambda: np.max(recent), "rms": lambda: np.sqrt(np.mean(recent ** 2)),
@@ -1648,7 +1650,7 @@ class MainWindow(W.QMainWindow):
             self.metric_cards[i].set_value_text(f"{value:.{self.value_decimals.value()}f}")
             clipped = bool(np.any(np.abs(raw[-min(len(raw), 1000):, j]) >= self.ranges[i] * 0.9999))
             self.metric_subs[i].setText("已达量程边界" if clipped else
-                                       f"{self.live_value_mode.currentText()} · 近 {len(recent) / self.engine.sample_rate:.3f} s")
+                                       f"近 {len(recent) / self.engine.sample_rate:.3f} s")
             self.metric_cards[i].sparkline.set_values(recent)
         if not self.pause_plot.isChecked():
             self._live_cache = times, raw
@@ -1753,6 +1755,9 @@ class MainWindow(W.QMainWindow):
                 bounds *= self.engine.sample_rate
             self.live_plot.setXRange(*bounds, padding=0)
 
+    def _metric_modes_changed(self, *_):
+        self._live_display_key = None
+
     def _live_visibility_changed(self, *_):
         self._live_display_key = None
         if self._live_cache is not None:
@@ -1779,7 +1784,7 @@ class MainWindow(W.QMainWindow):
 
     def _update_live_window_limit(self, *_):
         rate = self.engine.sample_rate if self.engine is not None else plan_clock(self.rate.currentData()).actual_rate
-        limit = math.floor(min(60, 200000 / rate) * 10) / 10
+        limit = max(.001, math.floor(min(60, 200000 / rate) * 1000) / 1000)
         self.live_seconds.setMaximum(limit)
         self.live_seconds.setToolTip(f"横轴显示时长，满窗后滚动。当前采样率最多显示 {limit:g} 秒（每通道最多 200,000 点）。不影响记录时长。")
         if isinstance(self.engine, RemoteEngine):
@@ -1874,26 +1879,21 @@ class MainWindow(W.QMainWindow):
         self._refresh_buttons()
 
     def choose_directory(self):
-        result = W.QFileDialog.getExistingDirectory(self, "选择记录目录", str(self.recording_root.parent))
+        result = W.QFileDialog.getExistingDirectory(self, "选择保存文件夹", str(self.recording_root))
         if result:
             self.recording_root = Path(result)
-            self.directory_label.setText(result)
-            self._refresh_disk_space()
+            self._refresh_recording_directory()
 
-    def _refresh_disk_space(self):
-        path = self.recording_root if self.recording_root.exists() else self.recording_root.parent
-        try:
-            free = shutil.disk_usage(path).free
-            self.disk_space_label.setText(f"可用空间：{free / 1024 ** 3:,.2f} GiB")
-        except OSError as exc:
-            self.disk_space_label.setText(f"无法读取可用空间：{exc}")
+    def _refresh_recording_directory(self, *_):
+        path = recording_directory(self.recording_root, self.experiment.text())
+        self.directory_button.setToolTip(f"当前工况保存到：{path}")
 
-    def _recording_options(self, group_number=0):
+    def _recording_options(self, group_number=None):
         return {"duration_seconds": self.recording_duration_seconds,
-                "specimen": self.specimen.text().strip(),
+                "specimen": "",
                 "condition": self.condition.text().strip(),
-                "notes": self.recording_notes.toPlainText(),
-                "group_number": group_number}
+                "notes": "",
+                "group_number": self.recording_sequence.value() if group_number is None else group_number}
 
     def _set_recording_options(self, options):
         if not isinstance(options, dict):
@@ -1901,9 +1901,11 @@ class MainWindow(W.QMainWindow):
         descriptive = {key: options.get(key, "") for key in ("specimen", "condition", "notes")}
         if any(not isinstance(value, str) for value in descriptive.values()):
             raise ValueError("试样、工况和记录备注必须为文本")
-        self.specimen.setText(descriptive["specimen"])
+        group = options.get("group_number", 1)
+        if type(group) is not int or group < 0:
+            raise ValueError("记录序号必须为非负整数")
         self.condition.setText(descriptive["condition"])
-        self.recording_notes.setPlainText(descriptive["notes"])
+        self.recording_sequence.setValue(max(1, group))
         duration = options.get("duration_seconds")
         with QtCore.QSignalBlocker(self.duration_mode), QtCore.QSignalBlocker(self.duration_input):
             index = self.duration_mode.findData(duration)
@@ -1920,7 +1922,8 @@ class MainWindow(W.QMainWindow):
         self.recording_duration_seconds = self.duration_input.value() if custom else duration
 
     def save_profile(self):
-        path, _ = W.QFileDialog.getSaveFileName(self, "保存实验配置", str(ROOT / "实验配置.json"), "JSON 配置 (*.json)")
+        initial = recording_directory(self.recording_root, self.experiment.text()) / "实验配置.json"
+        path, _ = W.QFileDialog.getSaveFileName(self, "保存实验配置", str(initial), "JSON 配置 (*.json)")
         if path:
             try:
                 self.save_profile_to(Path(path))
@@ -1936,15 +1939,17 @@ class MainWindow(W.QMainWindow):
                 "recording_options": self._recording_options(),
                 "display": {"live_time_axis": self.live_time_axis.currentData(),
                             "replay_time_axis": self.replay_time_axis.currentData(),
-                            "value_mode": self.live_value_mode.currentData(),
+                            "value_modes": [combo.currentData() for combo in self.metric_mode_combos],
                             "value_decimals": self.value_decimals.value(), "live_seconds": self.live_seconds.value()},
                 "input_hpf": str(self.input_hpf.path.resolve()) if self.input_hpf else None,
                 "hpf_loop": self.hpf_loop.isChecked()}
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        self.tell(f"配置已保存 · {path}")
+        self.tell(f"配置已保存 · {path}", "success")
 
     def load_profile(self):
-        path, _ = W.QFileDialog.getOpenFileName(self, "载入实验配置", str(ROOT), "JSON 配置 (*.json)")
+        initial = recording_directory(self.recording_root, self.experiment.text())
+        path, _ = W.QFileDialog.getOpenFileName(self, "载入实验配置", str(initial), "JSON 配置 (*.json)")
         if path:
             try:
                 self.load_profile_from(Path(path))
@@ -1983,17 +1988,22 @@ class MainWindow(W.QMainWindow):
             raise ValueError("记录时长必须为正的有限秒数，手动结束使用 null")
         display = data.get("display", {})
         for key, combo, default in (("live_time_axis", self.live_time_axis, "relative"),
-                                    ("replay_time_axis", self.replay_time_axis, "relative"),
-                                    ("value_mode", self.live_value_mode, "last")):
+                                    ("replay_time_axis", self.replay_time_axis, "relative")):
             if combo.findData(display.get(key, default)) < 0:
                 raise ValueError("未知的显示模式")
+        valid_modes = {mode for _, mode in METRIC_VALUE_MODES}
+        legacy_mode = display.get("value_mode", "last")
+        value_modes = display.get("value_modes", [legacy_mode] * 4)
+        if (not isinstance(value_modes, list) or len(value_modes) != 4
+                or any(mode not in valid_modes for mode in value_modes)):
+            raise ValueError("每个通道的读数模式必须有效")
         decimals = display.get("value_decimals", 3)
         if type(decimals) is not int or not 0 <= decimals <= 9:
             raise ValueError("显示小数位必须是 0 到 9 的整数")
         live_seconds = display.get("live_seconds", 10)
         if (isinstance(live_seconds, bool) or not isinstance(live_seconds, (int, float))
-                or not math.isfinite(live_seconds) or not .1 <= live_seconds <= 60):
-            raise ValueError("横轴显示时长必须在 0.1 到 60 秒之间")
+                or not math.isfinite(live_seconds) or not .001 <= live_seconds <= 60):
+            raise ValueError("横轴显示时长必须在 0.001 到 60 秒之间")
         reader = None
         if mode == "hpf":
             from .hpf import open_hpf
@@ -2024,7 +2034,8 @@ class MainWindow(W.QMainWindow):
         self._set_recording_options(options)
         self.live_time_axis.setCurrentIndex(self.live_time_axis.findData(display.get("live_time_axis", "relative")))
         self.replay_time_axis.setCurrentIndex(self.replay_time_axis.findData(display.get("replay_time_axis", "relative")))
-        self.live_value_mode.setCurrentIndex(self.live_value_mode.findData(display.get("value_mode", "last")))
+        for combo, value_mode in zip(self.metric_mode_combos, value_modes):
+            combo.setCurrentIndex(combo.findData(value_mode))
         self.value_decimals.setValue(decimals)
         self.live_seconds.setValue(live_seconds)
         self._sync_channel_labels()
@@ -2499,7 +2510,8 @@ class MainWindow(W.QMainWindow):
             return
         self.timer.stop()
         if isinstance(self.engine, RemoteEngine):
-            if not self.engine.running and not self.engine.connection_error:
+            if (not self.engine.running and not self.engine.output.get("running", False)
+                    and not self.engine.connection_error):
                 try:
                     self.engine.shutdown()
                 except (OSError, ValueError, RuntimeError):

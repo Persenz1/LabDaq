@@ -237,9 +237,7 @@ def test_gui_recording_to_library_comparison_end_to_end(tmp_path):
         window.scenario.setCurrentIndex(window.scenario.findData("drag"))
         window.recording_root = tmp_path
         window.experiment.setText("端到端重复实验")
-        window.specimen.setText("试样 E-01")
         window.condition.setText("室温 · 重复两次")
-        window.recording_notes.setPlainText("由采集页实际记录")
         window.channels[0] = ChannelSettings(0, "第一路", unit="V", point_number=7,
                                              direction="X+", engineering_offset=2.5)
         window.channels[2] = ChannelSettings(2, "第二路", unit="V", point_number=8,
@@ -247,11 +245,13 @@ def test_gui_recording_to_library_comparison_end_to_end(tmp_path):
         window.active_channels = (0, 2)
         window._sync_channel_labels()
         window.show()
-        for _ in range(2):
+        for group in (1, 2):
+            assert window.recording_sequence.value() == group
             window.record_button.click()
             wait(app, lambda: window.engine is not None and window.engine.recorded_scans >= 30)
             window.record_button.click()
             assert not window.engine.recording
+            assert window.recording_sequence.value() == group + 1
             paths.append(window.latest_recording)
         window.stop_button.click()
         library = RecordingLibraryDialog(tmp_path)
@@ -266,9 +266,9 @@ def test_gui_recording_to_library_comparison_end_to_end(tmp_path):
         wait(app, lambda: comparison.comparison_result is not None and comparison.job is None)
         assert {source.path for source in comparison.comparison_result.sources} == set(paths)
         for source in comparison.comparison_result.sources:
-            assert source.session.metadata["recording_options"]["specimen"] == "试样 E-01"
             assert source.session.metadata["recording_options"]["condition"] == "室温 · 重复两次"
-            assert source.session.metadata["recording_options"]["notes"] == "由采集页实际记录"
+            assert source.session.metadata["recording_options"]["specimen"] == ""
+            assert source.session.metadata["recording_options"]["notes"] == ""
             assert source.channels[0].point_number == 7
             assert source.channels[0].engineering_offset == 2.5
             assert source.session.sample_count >= 30

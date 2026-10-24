@@ -46,19 +46,21 @@ def _replace_metadata(temporary, target):
             time.sleep(.02)
 
 
-def next_recording_path(root, experiment, *, now=None) -> tuple[Path, int]:
-    """Choose the next daily experiment group without creating a directory."""
-    root = Path(root)
-    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", experiment).strip(" .") or "实验"
-    prefix = f"{(now or datetime.now()):%Y%m%d}_{name}_"
-    group = 1
-    if root.exists():
-        for entry in root.iterdir():
-            if entry.name.startswith(prefix):
-                suffix = entry.name[len(prefix):]
-                if suffix.isascii() and suffix.isdigit():
-                    group = max(group, int(suffix) + 1)
-    return root / f"{prefix}{group:03d}", group
+def _path_component(value, fallback):
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value).strip(" .") or fallback
+
+
+def recording_directory(root, experiment) -> Path:
+    return Path(root) / _path_component(experiment, "实验")
+
+
+def next_recording_path(root, experiment, condition="", group=1) -> tuple[Path, int]:
+    """Build a native session path without creating or replacing anything."""
+    if isinstance(group, bool) or not isinstance(group, Integral) or group < 1:
+        raise ValueError("记录序号必须从 1 开始")
+    group = int(group)
+    name = _path_component(condition, "未命名")
+    return recording_directory(root, experiment) / f"{name}-{group}", group
 
 
 class SessionRecorder:

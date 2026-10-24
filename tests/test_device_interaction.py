@@ -84,7 +84,7 @@ def test_startup_connects_only_then_preview_reuses_connection(workbench, monkeyp
     assert start.call_args.kwargs["connect_only"] is True
     assert window.engine is idle and not window.engine.running
     assert window.engine.total_scans == window.engine.recorded_scans == 0
-    assert window.preview_button.isEnabled() and not window.reconnect_button.isVisible()
+    assert window.preview_button.isEnabled() and window.reconnect_button.isVisible() and window.reconnect_button.text() == "断开设备"
     window.start_preview()
     assert window.engine is acquiring
     idle.stop.assert_not_called()
@@ -119,7 +119,25 @@ def test_failed_preview_keeps_polling_and_disconnect_is_prominent(workbench, mon
     spin(app, lambda: not window._connecting)
     assert window.engine is recovered and not recovered.running
     assert recovered.total_scans == 0 and not recovered.recording
-    assert not window.error_banner.isVisible() and not window.reconnect_button.isVisible()
+    assert not window.error_banner.isVisible() and window.reconnect_button.isVisible()
+    assert window.reconnect_button.text() == "断开设备"
+
+
+def test_connected_reconnect_button_disconnects_idle_device(workbench):
+    _, window = workbench
+    idle = idle_engine()
+    idle.disconnect = Mock(side_effect=lambda: idle._state.update(device_connected=False))
+    window.engine = idle
+    window._refresh_buttons()
+    assert window.reconnect_button.isVisible() and window.reconnect_button.isEnabled()
+    assert window.reconnect_button.text() == "断开设备"
+
+    window.reconnect_button.click()
+
+    idle.disconnect.assert_called_once_with()
+    assert window.reconnect_button.isVisible() and window.reconnect_button.isEnabled()
+    assert window.reconnect_button.text() == "重新连接"
+    assert "设备已断开" in window.notice.text()
 
 
 @pytest.mark.parametrize("selected", [(0, 2), (1,)])
@@ -150,7 +168,7 @@ def test_channel_selection_keeps_usb_connection_and_discards_old_samples(workben
     idle.stop.assert_not_called()
     idle.shutdown.assert_not_called()
     idle.detach.assert_not_called()
-    assert window.preview_button.isEnabled() and not window.reconnect_button.isVisible()
+    assert window.preview_button.isEnabled() and window.reconnect_button.isVisible() and window.reconnect_button.text() == "断开设备"
     assert "设备保持连接" in window.notice.text()
     for i, button in enumerate(window.live_channel_checks):
         assert button.parentWidget() is window.metric_cards[i]

@@ -399,7 +399,6 @@ impl State {
         recorder.metadata["analog_output_at_start"] = json!(self.usb.as_ref().map(|u| &u.output.status));
         recorder.metadata["analog_output_events"] = json!([]);
         recorder.save_metadata()?;
-        p.recording_root = path.parent().unwrap().to_path_buf();
         self.recorder = Some(recorder);
         self.last_recording = Some(path);
         self.recorded_scans = 0;
@@ -518,7 +517,7 @@ impl State {
             Command::SetChannels { channels } => self.set_channels(channels)?,
             Command::StartOutput { settings } => {
                 settings.validate()?;
-                let profile = self.profile.as_ref().ok_or("请先开始真实 USB 预览")?;
+                let profile = self.profile.as_ref().ok_or("请先连接真实 USB 设备")?;
                 // AO → AI0 is the current loopback wiring; excitation must remain off.
                 if profile.config.iepe[0] {
                     return Err("AO 回接 AI0 时必须关闭 AI0 的 IEPE；请停止采集后修改通道配置".into());
@@ -933,6 +932,29 @@ mod tests {
         assert_eq!(window["snapshot_start"], 0);
         assert_eq!(window["total_scans"], 40000);
         assert_eq!(window["raw"], json!(values));
+    }
+
+    #[test]
+    fn starting_native_recording_preserves_the_generic_recording_root() {
+        let root = recording_path("recording-root");
+        let recording_root = root.join("recordings");
+        let path = recording_root.join("实验名").join("工况-001");
+        let mut p = profile();
+        p.recording_root = recording_root.clone();
+        let mut state = State::new();
+        state
+            .command(Command::Start {
+                profile: Box::new(p),
+                recording_path: None,
+            })
+            .unwrap();
+        state.start_recording(path).unwrap();
+        assert_eq!(
+            state.profile.as_ref().unwrap().recording_root,
+            recording_root
+        );
+        state.finish_recording().unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

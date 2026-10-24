@@ -54,7 +54,7 @@ def test_stopped_buffer_is_drawn_once_but_display_changes_still_apply(stopped_di
     W.QApplication.processEvents()
     assert len(window.live_curves[0].getData()[0]) < len(raw)
 
-    window.live_value_mode.setCurrentIndex(window.live_value_mode.findData("mean"))
+    window.metric_mode_combos[0].setCurrentIndex(window.metric_mode_combos[0].findData("mean"))
     window.value_decimals.setValue(6)
     window.refresh()
     assert float(window.metric_values[0].text()) == pytest.approx(np.mean(raw[-2000:, 0]), abs=5.1e-7)

@@ -380,9 +380,6 @@ impl UsbInput {
     }
 
     pub fn start_output(&mut self, settings: crate::output::Settings) -> Result<(), Fault> {
-        if !self.started {
-            return Err(Fault::new("configuration_error", "请先开始真实 USB 预览，再启动 AO"));
-        }
         self.output.start(self.handle.as_ref().unwrap(), settings, self.fault.clone())
     }
 
@@ -399,9 +396,6 @@ impl UsbInput {
     pub fn stop(&mut self) -> Result<(), Fault> {
         let mut error = None;
         if let Some(h) = &self.handle {
-            if self.output.status.running || !self.output.status.zeroed {
-                error = self.output.stop(h).err();
-            }
             if self.started {
                 let stop_error = write(h, &dt::subsystem(false)).err();
                 if error.is_none() { error = stop_error; }
@@ -420,6 +414,10 @@ impl UsbInput {
     pub fn disconnect(&mut self) -> Result<(), Fault> {
         let mut error = self.stop().err();
         if let Some(h) = &self.handle {
+            if self.output.status.running || !self.output.status.zeroed {
+                let output_error = self.output.stop(h).err();
+                if error.is_none() { error = output_error; }
+            }
             if self.powered {
                 if let Err(e) = write(h, &dt::packet(52, &[0])) {
                     if error.is_none() {

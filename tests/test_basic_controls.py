@@ -115,13 +115,21 @@ def test_gui_pause_reconnect_numeric_modes_and_profile(tmp_path, monkeypatch):
                     "min": np.min(values), "max": np.max(values), "rms": np.sqrt(np.mean(values ** 2)),
                     "std": np.std(values), "delta": np.ptp(values)}
         for mode, truth in expected.items():
-            second.live_value_mode.setCurrentIndex(second.live_value_mode.findData(mode))
+            second.metric_mode_combos[0].setCurrentIndex(second.metric_mode_combos[0].findData(mode))
             second.refresh()
             assert float(second.metric_values[0].text()) == pytest.approx(truth, abs=5.1e-7)
+        modes = ["delta", "mean", "min", "max"]
+        for combo, mode in zip(second.metric_mode_combos, modes):
+            combo.setCurrentIndex(combo.findData(mode))
+        second.refresh()
+        assert float(second.metric_values[0].text()) == pytest.approx(expected["delta"], abs=5.1e-7)
+        assert float(second.metric_values[1].text()) == pytest.approx(expected["mean"], abs=5.1e-7)
+        assert float(second.metric_values[2].text()) == pytest.approx(expected["min"], abs=5.1e-7)
+        assert float(second.metric_values[3].text()) == pytest.approx(expected["max"], abs=5.1e-7)
         profile = tmp_path / "display.json"
         second.save_profile_to(profile)
         saved = json.loads(profile.read_text(encoding="utf-8"))
-        assert saved["display"]["value_mode"] == "delta" and saved["display"]["value_decimals"] == 6
+        assert saved["display"]["value_modes"] == modes and saved["display"]["value_decimals"] == 6
         second.pause_plot.setChecked(True)
         second.pause_record_button.click()
         spin(app, lambda: not second.engine.recording)
@@ -133,7 +141,13 @@ def test_gui_pause_reconnect_numeric_modes_and_profile(tmp_path, monkeypatch):
         second.stop_acquisition()
         second.load_profile_from(profile)
         assert second.live_time_axis.currentData() == "absolute"
-        assert second.live_value_mode.currentData() == "delta" and second.value_decimals.value() == 6
+        assert [combo.currentData() for combo in second.metric_mode_combos] == modes
+        assert second.value_decimals.value() == 6
+        saved["display"].pop("value_modes")
+        saved["display"]["value_mode"] = "rms"
+        profile.write_text(json.dumps(saved, ensure_ascii=False), encoding="utf-8")
+        second.load_profile_from(profile)
+        assert [combo.currentData() for combo in second.metric_mode_combos] == ["rms"] * 4
     finally:
         for window in (first, second):
             if window is not None and window.engine is not None:

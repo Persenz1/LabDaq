@@ -115,8 +115,7 @@ def test_fixed_groups_inline_duration_profile_and_replay(tmp_path):
         window.duration_mode.setCurrentIndex(window.duration_mode.findData(30))
         assert window.recording_duration_seconds == 30
         window.live_seconds.setValue(20)
-        window._set_recording_options({"duration_seconds": .137, "specimen": "试样 A-01",
-                                       "condition": "室温 · 加载 1 N", "notes": "加载 1 N\n模拟验证"})
+        window._set_recording_options({"duration_seconds": .137, "condition": "室温 · 加载 1 N"})
         profile = tmp_path / "profile.json"
         window.save_profile_to(profile)
         window._set_recording_options({})
@@ -125,26 +124,101 @@ def test_fixed_groups_inline_duration_profile_and_replay(tmp_path):
         assert window.duration_mode.currentData() == "custom"
         assert window.duration_input.value() == .137
         assert window.live_seconds.value() == 20
-        assert window._recording_options() | {"group_number": 0} == {
-            "duration_seconds": .137, "specimen": "试样 A-01", "condition": "室温 · 加载 1 N",
-            "notes": "加载 1 N\n模拟验证", "group_number": 0}
+        assert window._recording_options() == {
+            "duration_seconds": .137, "specimen": "", "condition": "室温 · 加载 1 N",
+            "notes": "", "group_number": 1}
         for group in (1, 2):
+            assert window.recording_sequence.value() == group
             window.toggle_record()
             path = window.latest_recording
-            assert path.name.endswith(f"_顺序实验_{group:03d}")
+            assert path == tmp_path / "顺序实验" / f"室温 · 加载 1 N-{group}"
             assert not window.duration_mode.isEnabled() and not window.duration_input.isEnabled()
-            assert not window.recording_notes.isEnabled()
+            assert not window.condition.isEnabled() and not window.recording_sequence.isEnabled()
             spin(app, lambda: not window.engine.recording and window.duration_mode.isEnabled())
             assert window.engine.running and window.duration_mode.isEnabled()
+            assert window.recording_sequence.value() == group + 1
             recording = load_session(path)
             assert recording.sample_count == int(recording.sample_rate * .137 + .5)
-            assert recording.metadata["recording_options"]["group_number"] == group
-            assert recording.metadata["recording_options"]["specimen"] == "试样 A-01"
-            assert recording.metadata["recording_options"]["condition"] == "室温 · 加载 1 N"
+            assert recording.metadata["recording_options"] == {
+                "duration_seconds": .137, "specimen": "", "condition": "室温 · 加载 1 N",
+                "notes": "", "group_number": group}
             window.open_replay(path)
-            assert recording.metadata["recording_options"]["notes"] == "加载 1 N\n模拟验证"
-            assert "试样 A-01" in window.replay_info.text()
             assert "定长记录完成" in window.replay_info.text()
+    finally:
+        window.close()
+        window.deleteLater()
+        QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.Type.DeferredDelete)
+        app.processEvents()
+
+
+@pytest.mark.parametrize("finish_mode", ["manual", "stop", "duration"])
+def test_record_completion_paths_increment_pending_sequence_exactly_once(tmp_path, monkeypatch, finish_mode):
+    from unittest.mock import Mock
+
+    app = W.QApplication.instance() or W.QApplication([])
+    configure_application(app)
+    window = MainWindow(core_endpoint=tmp_path / "unused.json")
+    try:
+        window.scenario.setCurrentIndex(window.scenario.findData("drag"))
+        window.recording_root = tmp_path
+        window.experiment.setText("收尾实验")
+        if finish_mode == "duration":
+            window._set_recording_options({"duration_seconds": .05})
+        window.condition.setText(finish_mode)
+        window.recording_sequence.setValue(4)
+        callback = Mock(wraps=window._record_completed)
+        monkeypatch.setattr(window, "_record_completed", callback)
+        window.toggle_record()
+        path = window.latest_recording
+        assert window.engine is not None and window.engine.recording
+        assert path == tmp_path / "收尾实验" / f"{finish_mode}-4"
+        assert window._pending_record == path and window.recording_sequence.value() == 4
+        if finish_mode == "manual":
+            spin(app, lambda: window.engine.recorded_scans >= 20)
+            window.toggle_record()
+        elif finish_mode == "stop":
+            spin(app, lambda: window.engine.recorded_scans >= 20)
+            window.stop_acquisition()
+        else:
+            spin(app, lambda: not window.engine.recording)
+        callback.assert_called_once_with(path)
+        assert window.recording_sequence.value() == 5
+        assert window.latest_recording == path and load_session(path).metadata["finalized"]
+        assert window.notice.text() == f"记录已保存 · {path}"
+        assert window.notice.styleSheet() == f"color: {window.p.success};"
+        window.refresh()
+        window._record_completed(path)
+        assert window.recording_sequence.value() == 5
+        assert load_session(path).metadata["recording_options"]["group_number"] == 4
+    finally:
+        window.stop_acquisition()
+        window.close()
+        window.deleteLater()
+        QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.Type.DeferredDelete)
+        app.processEvents()
+
+
+def test_recording_conflict_does_not_overwrite_or_advance_sequence(tmp_path):
+    app = W.QApplication.instance() or W.QApplication([])
+    configure_application(app)
+    window = MainWindow(core_endpoint=tmp_path / "unused.json")
+    try:
+        window.scenario.setCurrentIndex(window.scenario.findData("drag"))
+        window.recording_root = tmp_path
+        window.experiment.setText("冲突实验")
+        window.condition.setText("重复工况")
+        window.recording_sequence.setValue(7)
+        path = tmp_path / "冲突实验" / "重复工况-7"
+        path.mkdir(parents=True)
+        sentinel = path / "keep.txt"
+        sentinel.write_text("original", encoding="utf-8")
+
+        window.toggle_record()
+
+        assert window.engine is None and window.latest_recording is None
+        assert window._pending_record is None and window.recording_sequence.value() == 7
+        assert sentinel.read_text(encoding="utf-8") == "original"
+        assert "未覆盖" in window.notice.text()
     finally:
         window.close()
         window.deleteLater()

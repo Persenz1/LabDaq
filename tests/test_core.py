@@ -319,8 +319,8 @@ w.active_channels = (0, 2, 3)
 w.channels[2] = replace(w.channels[2], name="重连通道", zero_volts=.123, inverted=True)
 w.signal_settings = SimulationSettings(channels=(SignalSpec(frequency_hz=13.7),) * 4)
 w.experiment.setText("GUI崩溃续录")
-w._set_recording_options({"duration_seconds": json.loads(sys.argv[3]), "specimen": "试样 R",
-                          "condition": "重连验证", "notes": "退出后自动结束"})
+w._set_recording_options({"duration_seconds": json.loads(sys.argv[3]),
+                          "condition": "重连验证", "group_number": 7})
 w.toggle_record()
 assert w.engine and w.engine.recording, w.notice.text()
 w.show()
@@ -349,9 +349,8 @@ app.exec()
         window = MainWindow(core_endpoint=endpoint)
         assert window.engine.recording == (duration is None) and window.latest_recording == path
         assert window.recording_duration_seconds == duration
-        assert window.specimen.text() == "试样 R"
         assert window.condition.text() == "重连验证"
-        assert window.recording_notes.toPlainText() == "退出后自动结束"
+        assert window.recording_sequence.value() == (7 if duration is None else 8)
         assert window.active_channels == (0, 2, 3)
         assert window.channels[2].name == "重连通道" and window.channels[2].zero_volts == .123
         assert window.channels[2].inverted and window.experiment.text() == "GUI崩溃续录"
@@ -367,7 +366,8 @@ app.exec()
         assert recording.metadata["termination_reason"] == ("duration_complete" if duration is not None else "user_stop")
         if duration is not None:
             assert recording.sample_count == int(np.floor(recording.sample_rate * duration + .5))
-        assert len(list(tmp_path.glob("*/metadata.json"))) == 1
+        assert list(tmp_path.glob("*/*/metadata.json")) == [path / "metadata.json"]
+        assert path == tmp_path / "GUI崩溃续录" / "重连验证-7"
     finally:
         if process.poll() is None:
             process.kill()

@@ -25,12 +25,12 @@ def test_invalid_output_is_rejected_by_ui_and_core(core, change):
 def test_output_buttons_follow_device_and_core_state(workbench):
     _, window = workbench
     panel = window.output_panel
-    assert not panel.start_button.isEnabled()
+    assert not panel.start_button.isEnabled() and not panel.stop_button.isEnabled()
     engine = idle_engine()
     window.engine = engine
     window._refresh_buttons()
-    assert not panel.start_button.isEnabled()
-    engine._state["running"] = True
+    assert panel.start_button.isEnabled() and panel.stop_button.isEnabled()
+    assert "独立输出" in panel.status.text()
 
     def start(settings):
         engine._state["output"] = dict(running=True, settings=settings, actual_rate=48000, zeroed=False)
@@ -39,16 +39,20 @@ def test_output_buttons_follow_device_and_core_state(workbench):
         engine._state["output"].update(running=False, zeroed=True)
 
     engine.start_output, engine.stop_output = Mock(side_effect=start), Mock(side_effect=stop)
-    window._refresh_buttons()
     panel.start_button.click()
     engine.start_output.assert_called_once_with(DEFAULT_SETTINGS)
+    assert not engine.running
     assert not panel.waveform.isEnabled() and not panel.start_button.isEnabled()
     assert "输出中" in panel.status.text()
     window.nav.setCurrentRow(1)
     window.nav.setCurrentRow(0)
-    assert engine.output["running"]
+    assert engine.output["running"] and not engine.running
     engine.start_output.assert_called_once()
     engine.stop_output.assert_not_called()
+    window.stop_acquisition()
+    engine.stop.assert_called_once()
+    engine.stop_output.assert_not_called()
+    assert engine.output["running"]
     engine.connection_error = "lost"
     window._refresh_buttons()
     assert not panel.stop_button.isEnabled() and "未知" in panel.status.text()
@@ -56,7 +60,25 @@ def test_output_buttons_follow_device_and_core_state(workbench):
     window._refresh_buttons()
     panel.stop_button.click()
     engine.stop_output.assert_called_once()
-    assert engine.running and panel.start_button.isEnabled() and "0 V" in panel.status.text()
+    assert not engine.running and panel.start_button.isEnabled() and "0 V" in panel.status.text()
+
+    engine._state["running"] = True
+    window._refresh_buttons()
+    panel.start_button.click()
+    assert engine.running and engine.start_output.call_count == 2
+    panel.stop_button.click()
+    assert engine.running and engine.stop_output.call_count == 2
+
+
+def test_closing_gui_detaches_idle_ai_with_active_output(workbench):
+    _, window = workbench
+    engine = idle_engine()
+    engine._state["output"] = dict(running=True, settings=DEFAULT_SETTINGS,
+                                   actual_rate=48000, zeroed=False)
+    window.engine = engine
+    window.close()
+    engine.shutdown.assert_not_called()
+    engine.detach.assert_called_once()
 
 
 def test_output_config_load_never_starts_output(workbench, tmp_path):

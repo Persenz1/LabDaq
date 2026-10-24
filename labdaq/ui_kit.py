@@ -195,6 +195,11 @@ class Sparkline(W.QWidget):
         painter.drawPath(line)
 
 
+METRIC_VALUE_MODES = (("最新值", "last"), ("首值", "first"), ("均值", "mean"),
+                      ("最小值", "min"), ("最大值", "max"), ("RMS", "rms"),
+                      ("标准差", "std"), ("峰峰值", "delta"))
+
+
 class MetricCard(W.QFrame):
     """Channel readout card: identity, big number and trend line."""
 
@@ -241,8 +246,17 @@ class MetricCard(W.QFrame):
         self.sparkline = Sparkline(color, 27)
         outer.addWidget(self.sparkline)
 
+        mode_row = W.QHBoxLayout()
+        mode_row.setSpacing(6)
+        self.value_mode = W.QComboBox()
+        self.value_mode.setAccessibleName(f"{channel_label} 读数模式")
+        self.value_mode.setFixedSize(96, 24)
+        for title, mode in METRIC_VALUE_MODES:
+            self.value_mode.addItem(title, mode)
         self.sub_label = label("等待采样", "muted")
-        outer.addWidget(self.sub_label)
+        mode_row.addWidget(self.value_mode)
+        mode_row.addWidget(self.sub_label, 1)
+        outer.addLayout(mode_row)
 
         theme.soft_shadow(self, blur=24, dy=6, strength=16)
 

@@ -18,6 +18,7 @@ DIALOG_MARGINS = (22, 20, 22, 20)
 @dataclass
 class RecordingEntry:
     path: Path
+    relative_path: str = ""
     started_at: datetime | None = None
     experiment: str = ""
     specimen: str = ""
@@ -32,6 +33,10 @@ class RecordingEntry:
     abnormal: bool = False
 
     @property
+    def directory_name(self):
+        return self.relative_path or self.path.name
+
+    @property
     def batch_exportable(self):
         return self.error is None and self.finalized and not self.abnormal
 
@@ -42,25 +47,33 @@ class RecordingEntry:
     def matches(self, query):
         return query.casefold() in " ".join(
             (self.experiment, self.specimen, self.condition, self.notes,
-             self.path.name, self.status)).casefold()
+             self.directory_name, self.status)).casefold()
 
     @property
     def sort_key(self):
         return (self.started_at is not None,
                 self.started_at.timestamp() if self.started_at else 0,
-                self.path.name.casefold())
+                self.directory_name.casefold())
 
 
 def list_recordings(root) -> list[RecordingEntry]:
-    """Inspect direct child session folders; malformed sessions remain visible."""
+    """Inspect legacy direct sessions and native sessions one experiment level deep."""
     root = Path(root)
     if not root.exists():
         return []
-    entries = []
+    paths = []
     for path in root.iterdir():
-        if not path.is_dir() or not (path / "metadata.json").is_file():
+        if not path.is_dir():
             continue
-        entry = RecordingEntry(path)
+        if (path / "metadata.json").is_file():
+            paths.append(path)
+        else:
+            paths.extend(candidate for candidate in path.iterdir()
+                         if candidate.is_dir() and (candidate / "metadata.json").is_file())
+    entries = []
+    for path in paths:
+        relative_path = path.relative_to(root).as_posix()
+        entry = RecordingEntry(path, relative_path)
         try:
             session = load_session(path)
             metadata = session.metadata
@@ -98,7 +111,7 @@ def list_recordings(root) -> list[RecordingEntry]:
             if metadata.get("error"):
                 entry.status += f"：{metadata['error']}"
         except (OSError, ValueError, TypeError, KeyError, ZeroDivisionError, AttributeError) as exc:
-            entry = RecordingEntry(path, error=f"{type(exc).__name__}: {exc}")
+            entry = RecordingEntry(path, relative_path, error=f"{type(exc).__name__}: {exc}")
         entries.append(entry)
     return sorted(entries, key=lambda entry: entry.sort_key, reverse=True)
 
@@ -337,11 +350,12 @@ class RecordingLibraryDialog(W.QDialog):
                       str(entry.group_number) if entry.group_number is not None else "—",
                       f"{entry.duration_seconds:.3f}" if entry.duration_seconds is not None else "—",
                       str(entry.channel_count) if entry.channel_count is not None else "—",
-                      entry.status, entry.error or entry.notes, entry.path.name)
+                      entry.status, entry.error or entry.notes, entry.directory_name)
             sorts = (entry.sort_key, entry.experiment.casefold(), sample_condition.casefold(),
                      entry.group_number or 0,
                      entry.duration_seconds if entry.duration_seconds is not None else -1,
-                     entry.channel_count or 0, entry.status, entry.notes.casefold(), entry.path.name.casefold())
+                     entry.channel_count or 0, entry.status, entry.notes.casefold(),
+                     entry.directory_name.casefold())
             for column, (value, key) in enumerate(zip(values, sorts)):
                 item = _SortItem(value, key)
                 item.setData(QtCore.Qt.ItemDataRole.UserRole, entry)

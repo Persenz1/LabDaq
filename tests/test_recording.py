@@ -1,6 +1,5 @@
 import csv
 import json
-from datetime import datetime
 from types import SimpleNamespace
 
 import numpy as np
@@ -8,7 +7,7 @@ import pytest
 
 from labdaq.processing import ChannelSettings, convert_volts
 from labdaq.recording import (OperationCancelled, SessionRecorder, export_csv, export_txt, load_session,
-                             next_recording_path, session_statistics)
+                             next_recording_path, recording_directory, session_statistics)
 
 
 def test_export_progress_reaches_total_without_changing_values(tmp_path):
@@ -280,27 +279,33 @@ def test_invalid_recording_options_do_not_create_directory(tmp_path, options):
     assert not path.exists()
 
 
-def test_next_recording_path_uses_local_day_and_next_matching_group(tmp_path):
-    now = datetime(2026, 10, 19, 23, 59)
+def test_next_recording_path_uses_requested_condition_and_group_without_scanning(tmp_path):
     root = tmp_path / "recordings"
-    path, group = next_recording_path(root, "拉伸测试", now=now)
-    assert path == root / "20261019_拉伸测试_001" and group == 1
+    path, group = next_recording_path(root, "拉伸测试", "室温/10 N", 3)
+    assert path == root / "拉伸测试" / "室温_10 N-3" and group == 3
+    assert recording_directory(root, "拉伸测试") == root / "拉伸测试"
     assert not root.exists()
+
     path.mkdir(parents=True)
-    (root / "20261019_拉伸测试_003").mkdir()
-    (root / "20261018_拉伸测试_999").mkdir()
-    (root / "20261019_另一实验_999").mkdir()
-    (root / "20261019_拉伸测试_123_old").mkdir()
-    assert next_recording_path(root, "拉伸测试", now=now) == (root / "20261019_拉伸测试_004", 4)
-    (root / "20261019_拉伸测试_999").mkdir()
-    assert next_recording_path(root, "拉伸测试", now=now) == (root / "20261019_拉伸测试_1000", 1000)
+    (path.parent / "室温_10 N-99").mkdir()
+    (path.parent / "其他工况-100").mkdir()
+    assert next_recording_path(root, "拉伸测试", "室温/10 N", 3) == (path, 3)
+    assert next_recording_path(root, "拉伸测试", "室温/10 N") == (path.parent / "室温_10 N-1", 1)
+    assert next_recording_path(root, "拉伸测试", group=8) == (path.parent / "未命名-8", 8)
 
 
-def test_next_recording_path_sanitizes_windows_experiment_name(tmp_path):
-    now = datetime(2026, 10, 19)
-    path, group = next_recording_path(tmp_path, ' 力<>:"/\\|?*\x00 .', now=now)
-    assert path.name == "20261019_力___________001" and group == 1
-    assert next_recording_path(tmp_path, " . ", now=now)[0].name == "20261019_实验_001"
+def test_next_recording_path_sanitizes_windows_components(tmp_path):
+    path, group = next_recording_path(tmp_path, ' 力<>:"/\\|?*\x00 .', ' 工?况 . ', 12)
+    assert path == tmp_path / "力__________" / "工_况-12" and group == 12
+    assert recording_directory(tmp_path, " . ") == tmp_path / "实验"
+    assert next_recording_path(tmp_path, "", "")[0] == tmp_path / "实验" / "未命名-1"
+
+
+@pytest.mark.parametrize("group", [0, -1, 1.5, True, "1", None])
+def test_next_recording_path_rejects_invalid_group_without_creating_directories(tmp_path, group):
+    with pytest.raises(ValueError, match="从 1 开始"):
+        next_recording_path(tmp_path / "records", "实验", group=group)
+    assert not (tmp_path / "records").exists()
 
 
 def _selected_recording(tmp_path):

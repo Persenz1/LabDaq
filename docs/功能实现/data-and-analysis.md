@@ -24,7 +24,7 @@
 
 ## 会话文件
 
-每次 `SessionRecorder(path, sample_rate, channels, source='simulation', acquisition_config=None)` 建立一个新会话目录。`sample_rate` 必须传入设备实际采用的采样率，而非未经取整的请求值。
+每次 `SessionRecorder(path, sample_rate, channels, source='simulation', acquisition_config=None)` 建立一个新会话目录。`sample_rate` 必须传入设备实际采用的采样率，而非未经取整的请求值。实时页通过 `recording_directory(root, experiment)` 和 `next_recording_path(root, experiment, condition, group)` 生成 `通用根目录/实验名/工况-序号`；空工况为 `未命名`，序号从 1 开始，正常收尾后由界面递增。已有路径不会被覆盖。记录库同时读取旧版根目录直属会话和新版一级实验子目录中的会话，不继续向更深层递归。
 
 | 文件 | 内容 |
 | --- | --- |
@@ -58,7 +58,7 @@ session.iter_chunks(chunk_size=4096)  # 最后一块可以不足 4096 帧
 
 ## 实验描述信息与多组比较
 
-`recording_options` 保存 `duration_seconds`、`group_number`、`specimen`、`condition`、`notes`；实验名位于 `experiment`。这些文本随 JSON 预置和 Rust 核心配置恢复，记录开始后取快照。`update_recording_details(path, experiment=..., specimen=..., condition=..., notes=...)` 只允许修改可读且已收尾记录的描述信息，保留目录、组号、采样配置、原始帧和结束原因，并记录 `description_updated_at_utc`。元数据在相同目录写临时文件后原子替换，写回重新加载校验；短暂 Windows 占用只做有限次替换重试，持续失败仍报错。异常收尾组可以补充说明，但不会因此清除异常或允许批量导出。
+`recording_options` 保存 `duration_seconds`、`group_number`、`specimen`、`condition`、`notes`；实验名位于 `experiment`。当前实时页只编辑工况和序号，新记录的试样与备注为空；旧字段仍保留用于兼容历史记录和记录库编辑。这些文本随 JSON 预置和 Rust 核心配置恢复，记录开始后取快照。`update_recording_details(path, experiment=..., specimen=..., condition=..., notes=...)` 只允许修改可读且已收尾记录的描述信息，保留目录、组号、采样配置、原始帧和结束原因，并记录 `description_updated_at_utc`。元数据在相同目录写临时文件后原子替换，写回重新加载校验；短暂 Windows 占用只做有限次替换重试，持续失败仍报错。异常收尾组可以补充说明，但不会因此清除异常或允许批量导出。
 
 `labdaq.comparison.ComparisonSource` 引用一个 `RecordedSession` 和该组自己的通道快照。只接受 `finalized=true` 的记录；采集异常收尾组也可只读比较，并保留异常提示。每组默认使用全部物理通道，也可由布局恢复明确的通道子集。`load_comparison()` 分块读取，逐组最多 200,000 帧，所有通道合计最多 2,000,000 个数值；达到上限时 `ComparisonResult.truncated=true`，界面明确提示，不把截断结果当作全记录。
 

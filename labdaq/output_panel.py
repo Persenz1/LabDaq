@@ -46,7 +46,7 @@ class OutputPanel(CollapsibleSection):
             control.setValue(DEFAULT_SETTINGS[key])
             self.controls[key] = control
             self.add(field(title, control))
-        self.status = label("未输出 · 先开始真实 USB 预览", "muted", True)
+        self.status = label("未输出 · 请先连接设备", "muted", True)
         self.add(self.status)
         row = W.QHBoxLayout()
         self.start_button = W.QPushButton("开始输出")
@@ -57,7 +57,7 @@ class OutputPanel(CollapsibleSection):
         row.addWidget(self.stop_button)
         self.add_layout(row)
         self.add(label("输出范围 ±3 V；峰峰值为峰值幅度的 2 倍。回接 AI0 时关闭 IEPE。"
-                       "停止采集同时归零；关闭窗口后核心继续输出。", "faint", True))
+                       "AI 与 AO 独立启停；关闭窗口后核心继续输出。", "faint", True))
         self.waveform.currentIndexChanged.connect(self._waveform_changed)
         self.update_state(False, {})
 
@@ -97,5 +97,5 @@ class OutputPanel(CollapsibleSection):
         elif state.get("settings"):
             text = "输出已停止 · 归零未确认"
         else:
-            text = "未输出 · 先开始真实 USB 预览"
+            text = "设备已连接 · AO 独立输出" if ready else "未输出 · 请先连接设备"
         self.status.setText(text)
