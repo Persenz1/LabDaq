@@ -139,3 +139,30 @@ def test_library_preserves_end_reason_and_reports_invalid_metadata(tmp_path, cha
     assert entry.status == expected
     if expected == "不可打开":
         assert "组号" in entry.error
+
+
+def test_finalized_acquisition_error_can_open_but_not_batch_export(tmp_path):
+    app = W.QApplication.instance() or W.QApplication([])
+    path = make_recording(tmp_path, "采集异常", None)
+    metadata_path = path / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.update(termination_reason="acquisition_error", error="模拟设备断连")
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    entry, = list_recordings(tmp_path)
+    assert entry.finalized and entry.abnormal and not entry.batch_exportable
+
+    dialog = RecordingLibraryDialog(tmp_path)
+    try:
+        dialog.table.selectRow(0)
+        assert dialog.open_button.isEnabled()
+        assert not dialog.batch_export_button.isEnabled()
+        assert "采集异常" in dialog.detail.text()
+        assert "可单独打开" in dialog.detail.text()
+        dialog.open_button.click()
+        assert dialog.selected_path == path
+        assert dialog.result() == W.QDialog.DialogCode.Accepted
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.Type.DeferredDelete)
+        app.processEvents()

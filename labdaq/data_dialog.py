@@ -4,7 +4,7 @@ from pathlib import Path
 from PySide6 import QtCore, QtWidgets as W
 
 from . import theme, ui_kit
-from .recording import export_csv, load_session, session_statistics
+from .recording import OperationCancelled, export_csv, has_acquisition_error, load_session, session_statistics
 
 
 DIALOG_MARGINS = (22, 20, 22, 20)
@@ -107,8 +107,9 @@ def _dialog_footer(layout: W.QVBoxLayout, primary_text: str,
     return primary, cancel
 
 
-def export_recording_batch(sources, directory, *, values="both", time_format="seconds", delimiter=","):
-    """Export complete finalized groups in order, checking all destinations first."""
+def export_recording_batch(sources, directory, *, values="both", time_format="seconds", delimiter=",",
+                           progress=None, cancelled=None):
+    """Export finalized groups without acquisition errors, checking all destinations first."""
     if not sources:
         raise ValueError("请先选择至少一组记录")
     directory = Path(directory).resolve()
@@ -118,11 +119,15 @@ def export_recording_batch(sources, directory, *, values="both", time_format="se
     sessions, outputs = [], []
     destinations = set()
     for source in sources:
+        if cancelled is not None and cancelled():
+            return []
         path = Path(source.path if hasattr(source, "path") else source)
         try:
             session = load_session(path)
             if not session.metadata["finalized"]:
                 raise ValueError("记录尚未正常收尾，不能批量导出；活动记录请先结束，异常中断记录可单独打开后导出")
+            if has_acquisition_error(session.metadata):
+                raise ValueError("记录存在采集异常，不能批量导出；可单独打开并导出可读完整帧")
         except Exception as exc:
             raise ValueError(f"记录组 {path.name}：{exc}") from exc
         output = directory / (path.name + extension)
@@ -139,30 +144,69 @@ def export_recording_batch(sources, directory, *, values="both", time_format="se
         if any(output.is_relative_to(source) for output in outputs):
             raise ValueError(f"导出目录不能位于原始记录组 {session.path.name} 内")
     completed = []
+    completed_frames = 0
+    total_frames = sum(session.sample_count for session in sessions)
     for session, output in zip(sessions, outputs):
+        report = (None if progress is None else
+                  lambda done, _total, base=completed_frames: progress(base + done, total_frames))
         try:
             export_csv(session, output, values=values, time_format=time_format,
-                       delimiter=delimiter, overwrite=False)
+                       delimiter=delimiter, overwrite=False, progress=report, cancelled=cancelled)
+        except OperationCancelled:
+            return completed
         except Exception as exc:
             partial = "；失败组的输出文件可能不完整" if output.exists() else ""
             raise RuntimeError(f"记录组 {session.path.name} 导出失败：{exc}。"
                                f"已成功 {len(completed)} / {len(sessions)} 组，成功文件已保留{partial}") from exc
         completed.append(output)
+        completed_frames += session.sample_count
     return completed
 
 
 class _DataJob(QtCore.QThread):
+    progressed = QtCore.Signal(int)
+
     def __init__(self, operation, parent):
         super().__init__(parent)
         self.operation = operation
         self.result = None
         self.error = ""
+        self.cancelled = False
+        self._last_progress = -1
+
+    def report_progress(self, completed, total):
+        value = 1000 if total == 0 else max(0, min(1000, round(completed * 1000 / total)))
+        if value != self._last_progress:
+            self._last_progress = value
+            self.progressed.emit(value)
 
     def run(self):
         try:
-            self.result = self.operation()
+            self.result = self.operation(self)
+        except OperationCancelled:
+            self.cancelled = True
         except Exception as exc:
             self.error = f"{type(exc).__name__}: {exc}"
+
+
+def _progress_bar(layout):
+    progress = W.QProgressBar()
+    progress.setRange(0, 1000)
+    progress.setValue(0)
+    progress.setFormat("%p%")
+    progress.setVisible(False)
+    layout.addWidget(progress)
+    return progress
+
+
+def _request_cancel(dialog, button):
+    if dialog.job is None or not dialog.job.isRunning():
+        return False
+    dialog.job.requestInterruption()
+    button.setEnabled(False)
+    dialog.status.setText("正在取消，等待当前数据块结束…")
+    theme.set_tone(dialog.status, "warning")
+    return True
 
 
 class ExportDialog(W.QDialog):
@@ -173,7 +217,9 @@ class ExportDialog(W.QDialog):
         self.reader, self.start, self.stop = reader, start, stop
         self.channel_indices = channel_indices
         self.output_path = None
+        self.target_path = None
         self.job = None
+        self._close_when_finished = False
         layout = _dialog_layout(self)
 
         channels = "、".join(f"AI {index}" for index in channel_indices)
@@ -202,6 +248,7 @@ class ExportDialog(W.QDialog):
 
         self.status = _notice("文件首行包含原配置和本次导出区间、通道说明。", "info")
         layout.addWidget(self.status)
+        self.progress = _progress_bar(layout)
         layout.addStretch(1)
 
         self.save_button, self.cancel_button = _dialog_footer(layout, "选择文件并导出", "export")
@@ -217,14 +264,26 @@ class ExportDialog(W.QDialog):
             self.begin_export(path)
 
     def begin_export(self, path):
+        if self.job is not None and self.job.isRunning():
+            return
+        self.target_path = Path(path)
+        self.output_path = None
+        self._close_when_finished = False
         options = {"start": self.start, "stop": self.stop, "channel_indices": self.channel_indices,
                    "values": self.values.currentData(), "time_format": self.time_format.currentData(),
                    "delimiter": "\t" if self.file_format.currentIndex() else ","}
-        self.job = _DataJob(lambda: export_csv(self.reader, path, **options), self)
+        self.job = _DataJob(
+            lambda job, target=self.target_path: export_csv(
+                self.reader, target, **options, progress=job.report_progress,
+                cancelled=job.isInterruptionRequested), self)
+        self.job.progressed.connect(self.progress.setValue)
         self.job.finished.connect(self._finished)
-        for widget in (self.save_button, self.cancel_button, self.file_format, self.values,
-                       self.time_format):
+        for widget in (self.save_button, self.file_format, self.values, self.time_format):
             widget.setEnabled(False)
+        self.cancel_button.setEnabled(True)
+        self.cancel_button.setText("取消导出")
+        self.progress.setValue(0)
+        self.progress.setVisible(True)
         self.status.setText("正在分块导出…采集核心和界面刷新会继续。")
         theme.set_tone(self.status, "info")
         self.job.start()
@@ -232,22 +291,33 @@ class ExportDialog(W.QDialog):
     def _finished(self):
         job, self.job = self.job, None
         job.deleteLater()
-        if job.error:
+        self.progress.setVisible(False)
+        for widget in (self.save_button, self.cancel_button, self.file_format, self.values,
+                       self.time_format):
+            widget.setEnabled(True)
+        self.cancel_button.setText("取消")
+        if job.cancelled:
+            self.status.setText(f"导出已取消，未生成已确认的完整导出。目标文件可能不完整：{self.target_path}")
+            theme.set_tone(self.status, "warning")
+        elif job.error:
             self.status.setText(f"导出失败：{job.error}")
             theme.set_tone(self.status, "danger")
-            for widget in (self.save_button, self.cancel_button, self.file_format, self.values,
-                           self.time_format):
-                widget.setEnabled(True)
         else:
             self.output_path = job.result
             self.accept()
+            return
+        if self._close_when_finished:
+            self._close_when_finished = False
+            self.cancel_button.setText("关闭")
 
     def reject(self):
-        if self.job is None or not self.job.isRunning():
+        if not _request_cancel(self, self.cancel_button):
             super().reject()
 
     def closeEvent(self, event):
         if self.job is not None and self.job.isRunning():
+            self._close_when_finished = True
+            self.reject()
             event.ignore()
         else:
             super().closeEvent(event)
@@ -260,14 +330,16 @@ class BatchExportDialog(W.QDialog):
         super().__init__(parent)
         self.sources = list(paths_or_readers)
         self.output_paths = []
+        self.output_directory = None
         self.job = None
+        self._close_when_finished = False
         self.setWindowTitle("批量导出记录")
         self.setMinimumWidth(540)
         layout = _dialog_layout(self)
 
         layout.addWidget(_header(
             "批量导出记录",
-            "把选中的已收尾记录组按同一配置逐组导出，各组保留全部样本与通道。",
+            "把选中的已收尾且无采集异常的记录组按同一配置逐组导出，各组保留全部样本与通道。",
             "export"))
         layout.addWidget(_metric_strip([
             ("记录组数", f"{len(self.sources)} 组"),
@@ -290,8 +362,9 @@ class BatchExportDialog(W.QDialog):
 
         layout.addWidget(ui_kit.label(
             "每组生成同名 CSV/TXT 文件，已有同名文件时停止并提示另选目录。", "muted", True))
-        self.status = _notice("仅可导出已经收尾的记录；导出逐组分块执行。", "warning")
+        self.status = _notice("仅可导出已经收尾且无采集异常的记录；导出逐组分块执行。", "warning")
         layout.addWidget(self.status)
+        self.progress = _progress_bar(layout)
         layout.addStretch(1)
 
         self.save_button, self.cancel_button = _dialog_footer(layout, "选择目录并导出", "export")
@@ -306,13 +379,29 @@ class BatchExportDialog(W.QDialog):
             self.begin_export(directory)
 
     def begin_export(self, directory):
+        if self.job is not None and self.job.isRunning():
+            return
+        self.output_directory = Path(directory)
+        self.output_paths = []
+        self._close_when_finished = False
         options = {"values": self.values.currentData(), "time_format": self.time_format.currentData(),
                    "delimiter": "\t" if self.file_format.currentIndex() else ","}
-        self.job = _DataJob(lambda: export_recording_batch(self.sources, directory, **options), self)
+        self.job = _DataJob(
+            lambda job: export_recording_batch(
+                self.sources, self.output_directory, **options, progress=job.report_progress,
+                cancelled=job.isInterruptionRequested), self)
+        self.job.progressed.connect(self.progress.setValue)
         self.job.finished.connect(self._finished)
-        for widget in (self.save_button, self.cancel_button, self.file_format, self.values,
-                       self.time_format):
+        self.save_button.show()
+        self.save_button.setEnabled(False)
+        for widget in (self.file_format, self.values, self.time_format):
             widget.setEnabled(False)
+        self.cancel_button.setEnabled(True)
+        self.cancel_button.setText("取消导出")
+        self.cancel_button.setObjectName("ghost")
+        theme.repolish(self.cancel_button)
+        self.progress.setValue(0)
+        self.progress.setVisible(True)
         self.status.setText(f"正在逐组分块导出 {len(self.sources)} 组记录…采集核心和界面刷新会继续。")
         theme.set_tone(self.status, "info")
         self.job.start()
@@ -320,29 +409,44 @@ class BatchExportDialog(W.QDialog):
     def _finished(self):
         job, self.job = self.job, None
         job.deleteLater()
+        self.progress.setVisible(False)
         for widget in (self.file_format, self.values, self.time_format):
             widget.setEnabled(True)
+        self.save_button.setEnabled(True)
+        self.cancel_button.setEnabled(True)
+        self.cancel_button.setText("取消")
         if job.error:
-            self.save_button.setEnabled(True)
-            self.cancel_button.setEnabled(True)
             self.status.setText(f"批量导出未完成：{job.error}")
             theme.set_tone(self.status, "danger")
         else:
-            self.output_paths = job.result
-            self.status.setText(f"已成功导出 {len(self.output_paths)} 组记录到：\n{self.output_paths[0].parent}")
-            theme.set_tone(self.status, "success")
-            self.save_button.hide()
-            self.cancel_button.setText("关闭")
-            self.cancel_button.setEnabled(True)
-            self.cancel_button.setObjectName("primary")
-            theme.repolish(self.cancel_button)
+            self.output_paths = job.result or []
+            if job.cancelled or len(self.output_paths) < len(self.sources):
+                self.status.setText(
+                    f"批量导出已取消；已完成 {len(self.output_paths)} / {len(self.sources)} 组，成功文件已保留。"
+                    f"当前组可能留有不完整输出，请检查：\n{self.output_directory}")
+                theme.set_tone(self.status, "warning")
+            else:
+                self.status.setText(f"已成功导出 {len(self.output_paths)} 组记录到：\n{self.output_paths[0].parent}")
+                theme.set_tone(self.status, "success")
+                self.save_button.hide()
+                self.cancel_button.setText("关闭")
+                self.cancel_button.setObjectName("primary")
+                theme.repolish(self.cancel_button)
+        if self._close_when_finished:
+            self._close_when_finished = False
+            if not job.error and not job.cancelled and len(self.output_paths) == len(self.sources):
+                self.reject()
+            else:
+                self.cancel_button.setText("关闭")
 
     def reject(self):
-        if self.job is None or not self.job.isRunning():
+        if not _request_cancel(self, self.cancel_button):
             super().reject()
 
     def closeEvent(self, event):
         if self.job is not None and self.job.isRunning():
+            self._close_when_finished = True
+            self.reject()
             event.ignore()
         else:
             super().closeEvent(event)
@@ -356,6 +460,7 @@ class StatisticsDialog(W.QDialog):
         self.setMinimumSize(760, 340)
         self.reader, self.start, self.stop, self.channel_indices = reader, start, stop, channel_indices
         self.job = None
+        self._close_when_finished = False
         p = theme.current()
         layout = _dialog_layout(self)
 
@@ -367,6 +472,7 @@ class StatisticsDialog(W.QDialog):
             f"样本区间 [{start:,}, {stop:,}) · {stop - start:,} 帧；标准差采用总体定义（ddof=0）。",
             "info")
         layout.addWidget(self.status)
+        self.progress = _progress_bar(layout)
 
         self.values = W.QComboBox()
         self.values.addItem("工程值", "engineering")
@@ -410,35 +516,56 @@ class StatisticsDialog(W.QDialog):
         self.calculate()
 
     def calculate(self, *_):
+        if self.job is not None and self.job.isRunning():
+            return
+        self._close_when_finished = False
         mode = self.values.currentData()
-        self.job = _DataJob(lambda: session_statistics(self.reader, start=self.start, stop=self.stop,
-                                                      channel_indices=self.channel_indices, values=mode), self)
+        self.job = _DataJob(
+            lambda job: session_statistics(
+                self.reader, start=self.start, stop=self.stop, channel_indices=self.channel_indices,
+                values=mode, progress=job.report_progress, cancelled=job.isInterruptionRequested), self)
+        self.job.progressed.connect(self.progress.setValue)
         self.job.finished.connect(self._finished)
-        for widget in (self.values, self.copy_button, self.close_button):
-            widget.setEnabled(False)
+        self.table.setRowCount(0)
+        self.values.setEnabled(False)
+        self.copy_button.setEnabled(False)
+        self.close_button.setEnabled(True)
+        self.close_button.setText("取消统计")
+        self.progress.setValue(0)
+        self.progress.setVisible(True)
+        self.status.setText("正在分块统计…采集核心和界面刷新会继续。")
+        theme.set_tone(self.status, "info")
         self.job.start()
 
     def _finished(self):
         job, self.job = self.job, None
         job.deleteLater()
+        self.progress.setVisible(False)
         self.values.setEnabled(True)
         self.close_button.setEnabled(True)
-        if job.error:
+        self.close_button.setText("关闭")
+        if job.cancelled:
+            self.status.setText("统计已取消；未显示不完整结果。")
+            theme.set_tone(self.status, "warning")
+        elif job.error:
             self.status.setText(f"统计失败：{job.error}")
             theme.set_tone(self.status, "danger")
-            return
-        self.table.setRowCount(len(job.result))
-        for row, stat in enumerate(job.result):
-            values = [f"AI {stat['index']} · {stat['name']}", stat["unit"], str(stat["count"])]
-            values += [f"{stat[key]:.10g}" for key in ("min", "max", "delta", "mean", "std", "rms")]
-            for col, value in enumerate(values):
-                item = W.QTableWidgetItem(value)
-                if col >= 2:
-                    item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight |
+        else:
+            self.table.setRowCount(len(job.result))
+            for row, stat in enumerate(job.result):
+                values = [f"AI {stat['index']} · {stat['name']}", stat["unit"], str(stat["count"])]
+                values += [f"{stat[key]:.10g}" for key in ("min", "max", "delta", "mean", "std", "rms")]
+                for col, value in enumerate(values):
+                    item = W.QTableWidgetItem(value)
+                    if col >= 2:
+                        item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight |
                                           QtCore.Qt.AlignmentFlag.AlignVCenter)
-                self.table.setItem(row, col, item)
-        theme.set_tone(self.status, "info")
-        self.copy_button.setEnabled(True)
+                    self.table.setItem(row, col, item)
+            self.status.setText("统计完成；标准差采用总体定义（ddof=0）。")
+            theme.set_tone(self.status, "info")
+            self.copy_button.setEnabled(True)
+        if self._close_when_finished:
+            self.reject()
 
     def copy_table(self):
         rows = [[self.table.horizontalHeaderItem(i).text() for i in range(self.table.columnCount())]]
@@ -447,11 +574,13 @@ class StatisticsDialog(W.QDialog):
         W.QApplication.clipboard().setText("\n".join("\t".join(row) for row in rows))
 
     def reject(self):
-        if self.job is None or not self.job.isRunning():
+        if not _request_cancel(self, self.close_button):
             super().reject()
 
     def closeEvent(self, event):
         if self.job is not None and self.job.isRunning():
+            self._close_when_finished = True
+            self.reject()
             event.ignore()
         else:
             super().closeEvent(event)

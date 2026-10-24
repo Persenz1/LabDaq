@@ -8,7 +8,7 @@ from pathlib import Path
 from PySide6 import QtCore, QtGui, QtWidgets as W
 
 from . import theme, ui_kit
-from .recording import load_session
+from .recording import has_acquisition_error, load_session
 from .data_dialog import BatchExportDialog
 
 
@@ -27,6 +27,11 @@ class RecordingEntry:
     notes: str = ""
     error: str | None = None
     finalized: bool = False
+    abnormal: bool = False
+
+    @property
+    def batch_exportable(self):
+        return self.error is None and self.finalized and not self.abnormal
 
     def matches(self, query):
         return query.casefold() in " ".join(
@@ -73,9 +78,10 @@ def list_recordings(root) -> list[RecordingEntry]:
             reason = metadata.get("termination_reason")
             if reason is not None and not isinstance(reason, str):
                 raise ValueError("记录结束状态必须为文本")
+            entry.abnormal = has_acquisition_error(metadata)
             if not metadata["finalized"]:
                 entry.status = "未正常收尾"
-            elif metadata.get("error") or reason in ("error", "acquisition_error"):
+            elif entry.abnormal:
                 entry.status = f"异常（{reason or '未提供原因'}）"
             else:
                 entry.status = {"duration_complete": "定长完成", "user_stop": "手动结束",
@@ -304,18 +310,21 @@ class RecordingLibraryDialog(W.QDialog):
         entry = self._selected_entry()
         selected = self._selected_entries()
         self.open_button.setEnabled(entry is not None and entry.error is None)
-        can_export = bool(selected) and all(item.error is None and item.finalized for item in selected)
+        can_export = bool(selected) and all(item.batch_exportable for item in selected)
         self.batch_export_button.setEnabled(can_export)
         self.batch_export_button.setToolTip("导出全部选中记录组的全部样本和通道" if can_export else
-                                            "请使用 Ctrl/Shift 选择可读且已收尾的记录组")
+                                            "请使用 Ctrl/Shift 选择可读、已收尾且无采集异常的记录组")
         incomplete = [item for item in selected if item.error is None and not item.finalized]
+        abnormal = [item for item in selected if item.error is None and item.abnormal and item.finalized]
         detail = f"{entry.path}\n{entry.error or entry.status}" if entry else getattr(self, "_count_text", "")
         if len(selected) > 1:
             detail += f"\n已选择 {len(selected)} 组；打开仅打开当前组，批量导出处理全部选中组。"
         if incomplete:
             detail += "\n选中记录尚未收尾，不能批量导出；活动记录请先结束，异常中断记录可单独打开后导出。"
+        if abnormal:
+            detail += "\n选中记录存在采集异常，不能批量导出；可单独打开后导出可读完整帧。"
         self.detail.setText(detail)
-        if entry is not None and entry.error:
+        if entry is not None and (entry.error or entry.abnormal):
             dot = p.danger
         elif incomplete:
             dot = p.warning
@@ -333,5 +342,5 @@ class RecordingLibraryDialog(W.QDialog):
 
     def _batch_export(self):
         entries = self._selected_entries()
-        if entries and all(entry.error is None and entry.finalized for entry in entries):
+        if entries and all(entry.batch_exportable for entry in entries):
             BatchExportDialog([entry.path for entry in entries], self).exec()

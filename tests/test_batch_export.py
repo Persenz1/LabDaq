@@ -2,6 +2,7 @@
 import csv
 import json
 import os
+import threading
 import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -16,6 +17,107 @@ from labdaq.data_dialog import BatchExportDialog, export_recording_batch
 from labdaq.processing import ChannelSettings
 from labdaq.recording import SessionRecorder, load_session
 from labdaq.recording_library import RecordingLibraryDialog
+
+
+@pytest.mark.parametrize("changes", [
+    {"error": "模拟采集错误"},
+    {"termination_reason": "acquisition_error"},
+])
+def test_batch_preflight_rejects_finalized_acquisition_errors(tmp_path, monkeypatch, changes):
+    path, _ = make_group(tmp_path, "abnormal", [0])
+    metadata_path = path / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.update(changes)
+    assert metadata["finalized"] is True
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    output = tmp_path / "exported"
+    output.mkdir()
+
+    def no_raw_reads(*_args, **_kwargs):
+        pytest.fail("preflight must not read raw samples")
+
+    monkeypatch.setattr(type(load_session(path)), "read", no_raw_reads)
+    with pytest.raises(ValueError, match="abnormal.*采集异常"):
+        export_recording_batch([path], output)
+    assert list(output.iterdir()) == []
+
+
+def test_batch_dialog_close_cancels_second_group_and_keeps_first(tmp_path, monkeypatch):
+    app = W.QApplication.instance() or W.QApplication([])
+    first, _ = make_group(tmp_path, "001", [0])
+    second = tmp_path / "002"
+    with SessionRecorder(second, 4, [ChannelSettings(1, "通道 1")]) as recorder:
+        recorder.write(np.arange(9000, dtype=float)[:, None])
+    output = tmp_path / "exported"
+    output.mkdir()
+    original_export = data_dialog.export_csv
+    entered, release = threading.Event(), threading.Event()
+
+    def controlled_second(session, destination, **kwargs):
+        if session.path == first:
+            return original_export(session, destination, **kwargs)
+        assert session.path == second
+        progress = kwargs.pop("progress")
+        def pause_after_first_chunk(done, total):
+            progress(done, total)
+            if done == 4096:
+                entered.set()
+                if not release.wait(8):
+                    raise TimeoutError("test did not release batch export")
+        return original_export(session, destination, progress=pause_after_first_chunk, **kwargs)
+
+    monkeypatch.setattr(data_dialog, "export_csv", controlled_second)
+    dialog = BatchExportDialog([first, second])
+    try:
+        dialog.show()
+        app.processEvents()
+        dialog.begin_export(output)
+        deadline = time.monotonic() + 8
+        while not entered.is_set() and time.monotonic() < deadline:
+            app.processEvents()
+            QTest.qWait(10)
+        app.processEvents()
+        assert entered.is_set()
+        assert dialog.progress.value() == 455
+        assert (output / "001.csv").is_file()
+        dialog.close()
+        app.processEvents()
+        assert dialog.isVisible() and dialog._close_when_finished
+        assert not dialog.cancel_button.isEnabled()
+        assert "正在取消" in dialog.status.text()
+        release.set()
+        deadline = time.monotonic() + 8
+        while dialog.job is not None and time.monotonic() < deadline:
+            app.processEvents()
+            QTest.qWait(10)
+        app.processEvents()
+        assert dialog.job is None
+        assert dialog.isVisible() and dialog.status.isVisible()
+        assert not dialog._close_when_finished
+        assert dialog.output_paths == [output / "001.csv"]
+        assert "已取消" in dialog.status.text() and "已完成 1 / 2 组" in dialog.status.text()
+        assert "不完整" in dialog.status.text() and str(output) in dialog.status.text()
+        _, _, exported = read_export(output / "001.csv", ",")
+        assert exported.shape == (5, 3)
+        _, _, partial = read_export(output / "002.csv", ",")
+        np.testing.assert_array_equal(partial[:, 1], np.arange(4096))
+        assert dialog.save_button.isEnabled() and dialog.cancel_button.isEnabled()
+        assert dialog.file_format.isEnabled() and dialog.values.isEnabled()
+        assert dialog.time_format.isEnabled()
+        assert dialog.cancel_button.text() == "关闭"
+        dialog.cancel_button.click()
+        assert not dialog.isVisible()
+        assert dialog.result() == W.QDialog.DialogCode.Rejected
+    finally:
+        release.set()
+        deadline = time.monotonic() + 8
+        while dialog.job is not None and time.monotonic() < deadline:
+            app.processEvents()
+            QTest.qWait(10)
+        dialog.close()
+        dialog.deleteLater()
+        QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.Type.DeferredDelete)
+        app.processEvents()
 
 
 def make_group(root, name, indices):

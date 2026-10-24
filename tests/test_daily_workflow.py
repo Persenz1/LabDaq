@@ -2,6 +2,7 @@
 import csv
 import json
 import os
+import threading
 import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -11,13 +12,119 @@ import pytest
 from PySide6 import QtCore, QtGui, QtWidgets as W
 from PySide6.QtTest import QTest
 
+from labdaq import data_dialog
 from labdaq.core_client import CORE_EXE, CoreClient
 from labdaq.data_dialog import ExportDialog, StatisticsDialog
 from labdaq.gui import MainWindow, configure_application
 from labdaq.processing import ChannelSettings, convert_volts
-from labdaq.recording import SessionRecorder, load_session
+from labdaq.recording import OperationCancelled, SessionRecorder, load_session
 from labdaq.recording_library import RecordingLibraryDialog
 from labdaq.signals import SignalSpec, SimulationSettings
+
+
+def test_export_dialog_close_waits_for_controlled_cancellation(tmp_path, monkeypatch):
+    app = W.QApplication.instance() or W.QApplication([])
+    configure_application(app)
+    path = tmp_path / "session"
+    with SessionRecorder(path, 1000, [ChannelSettings(0, "X", unit="V")]) as recorder:
+        recorder.write(np.arange(9000, dtype=float)[:, None])
+    reader = load_session(path)
+    entered, release = threading.Event(), threading.Event()
+    original_export = data_dialog.export_csv
+
+    def controlled_export(*args, progress, **kwargs):
+        def pause_after_first_chunk(done, total):
+            progress(done, total)
+            if done == 4096:
+                entered.set()
+                if not release.wait(8):
+                    raise TimeoutError("test did not release export")
+        return original_export(*args, progress=pause_after_first_chunk, **kwargs)
+
+    monkeypatch.setattr(data_dialog, "export_csv", controlled_export)
+    dialog = ExportDialog(reader, 0, 9000, [0])
+    try:
+        dialog.show()
+        app.processEvents()
+        output = tmp_path / "cancelled.csv"
+        dialog.begin_export(output)
+        spin(app, entered.is_set)
+        assert dialog.progress.value() == 455
+        dialog.close()
+        app.processEvents()
+        assert dialog.isVisible()
+        assert dialog._close_when_finished
+        assert not dialog.cancel_button.isEnabled()
+        assert "正在取消" in dialog.status.text()
+        release.set()
+        spin(app, lambda: dialog.job is None)
+        assert dialog.isVisible() and dialog.status.isVisible()
+        assert not dialog._close_when_finished
+        assert dialog.output_path is None
+        assert dialog.target_path == output
+        assert "已取消" in dialog.status.text() and "可能不完整" in dialog.status.text()
+        assert str(output) in dialog.status.text()
+        with output.open(encoding="utf-8-sig", newline="") as handle:
+            handle.readline()
+            rows = list(csv.reader(handle))
+        np.testing.assert_array_equal(np.asarray(rows[1:], dtype=float)[:, 1], np.arange(4096))
+        assert dialog.save_button.isEnabled()
+        assert dialog.file_format.isEnabled() and dialog.values.isEnabled()
+        assert dialog.time_format.isEnabled() and dialog.cancel_button.isEnabled()
+        assert dialog.cancel_button.text() == "关闭"
+        dialog.cancel_button.click()
+        assert not dialog.isVisible()
+        assert dialog.result() == W.QDialog.DialogCode.Rejected
+    finally:
+        release.set()
+        if dialog.job is not None:
+            spin(app, lambda: dialog.job is None)
+        dispose(app, dialog)
+
+
+def test_statistics_dialog_cancellation_discards_partial_results(tmp_path, monkeypatch):
+    app = W.QApplication.instance() or W.QApplication([])
+    configure_application(app)
+    path = tmp_path / "session"
+    with SessionRecorder(path, 1000, [ChannelSettings(0, "X", unit="V")]) as recorder:
+        recorder.write(np.arange(8, dtype=float)[:, None])
+    reader = load_session(path)
+    entered, release = threading.Event(), threading.Event()
+
+    def controlled_statistics(*_args, progress, cancelled, **_kwargs):
+        progress(2, 5)
+        entered.set()
+        if not release.wait(8):
+            raise TimeoutError("test did not release statistics")
+        if cancelled():
+            raise OperationCancelled("操作已取消")
+        return [{"index": 0, "name": "partial", "unit": "V", "count": 2,
+                 "min": 0, "max": 1, "delta": 1, "mean": .5, "std": .5, "rms": .7}]
+
+    monkeypatch.setattr(data_dialog, "session_statistics", controlled_statistics)
+    dialog = StatisticsDialog(reader, 0, 8, [0])
+    try:
+        dialog.show()
+        spin(app, entered.is_set)
+        assert dialog.progress.value() == 400
+        assert dialog.table.rowCount() == 0
+        dialog.close_button.click()
+        app.processEvents()
+        assert dialog.isVisible()
+        assert not dialog.close_button.isEnabled()
+        assert "正在取消" in dialog.status.text()
+        release.set()
+        spin(app, lambda: dialog.job is None)
+        assert dialog.table.rowCount() == 0
+        assert "已取消" in dialog.status.text() and "未显示不完整结果" in dialog.status.text()
+        assert dialog.values.isEnabled() and dialog.close_button.isEnabled()
+        assert not dialog.copy_button.isEnabled()
+        assert dialog.close_button.text() == "关闭"
+    finally:
+        release.set()
+        if dialog.job is not None:
+            spin(app, lambda: dialog.job is None)
+        dispose(app, dialog)
 
 
 def spin(app, predicate, timeout=8):

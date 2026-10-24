@@ -1200,6 +1200,8 @@ class MainWindow(W.QMainWindow):
             self.error_title.setText(error_title)
             self.error_details.setText(text)
             self.error_banner.show()
+        else:
+            self.error_banner.hide()
 
     def start_preview(self):
         self._begin_input()
@@ -2322,7 +2324,7 @@ class MainWindow(W.QMainWindow):
         try:
             devices = enumerate_usb_devices()
             self.device_result.setText("\n".join(f"VID {d['vendor_id']:04X} / PID {d['product_id']:04X} · {d['state']} · {d['model']}" for d in devices)
-                                      or "未发现 DT9837 系列 USB 设备。当前仍为协议模拟模式。")
+                                      or "未发现 DT9837 系列 USB 设备。当前未连接设备，请检查 USB 后重新扫描。")
         except Exception as exc:
             self.device_result.setText(f"USB 枚举未完成：{exc}")
 

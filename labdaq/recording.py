@@ -19,6 +19,21 @@ def _utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 
+class OperationCancelled(Exception):
+    pass
+
+
+def has_acquisition_error(metadata):
+    return bool(metadata.get("error") or metadata.get("termination_reason") in ("error", "acquisition_error"))
+
+
+def _task_progress(progress, cancelled, completed, total):
+    if cancelled is not None and cancelled():
+        raise OperationCancelled("操作已取消")
+    if progress is not None:
+        progress(completed, total)
+
+
 def next_recording_path(root, experiment, *, now=None) -> tuple[Path, int]:
     """Choose the next daily experiment group without creating a directory."""
     root = Path(root)
@@ -361,7 +376,8 @@ def _session_selection(session_or_path, start, stop, channel_indices, chunk_size
 
 
 def export_csv(session_path, output_path, chunk_size=4096, *, start=0, stop=None,
-               channel_indices=None, values="both", time_format="seconds", delimiter=",", overwrite=True):
+               channel_indices=None, values="both", time_format="seconds", delimiter=",", overwrite=True,
+               progress=None, cancelled=None):
     """Stream a selected interval and physical channels to CSV or tabbed text.
 
     ``start`` is inclusive and ``stop`` exclusive. Time retains original scan
@@ -399,11 +415,14 @@ def export_csv(session_path, output_path, chunk_size=4096, *, start=0, stop=None
         headings += [f"{ch.name}[AI{ch.index}]_raw_V" for ch in channels]
     if values in ("engineering", "both"):
         headings += [f"{ch.name}[AI{ch.index}]_{ch.unit}" for ch in channels]
+    total = stop - start
+    _task_progress(progress, cancelled, 0, total)
     with output_path.open("w" if overwrite else "x", encoding="utf-8-sig", newline="") as handle:
         handle.write("# labdaq_metadata: " + json.dumps(metadata, ensure_ascii=False) + "\n")
         writer = csv.writer(handle, delimiter=delimiter)
         writer.writerow(headings)
         for first in range(start, stop, chunk_size):
+            _task_progress(progress, cancelled, first - start, total)
             raw = session.read(first, min(chunk_size, stop - first))[:, columns]
             indices = (session.sample_indices(first, len(raw)) if hasattr(session, "sample_indices")
                        else np.arange(first, first + len(raw)))
@@ -416,6 +435,7 @@ def export_csv(session_path, output_path, chunk_size=4096, *, start=0, stop=None
                 scan = int(indices[offset])
                 time = scan if time_scale is None else scan / session.sample_rate * time_scale
                 writer.writerow([time, *row])
+            _task_progress(progress, cancelled, first + len(raw) - start, total)
     return output_path
 
 
@@ -425,7 +445,7 @@ def export_txt(session_path, output_path, chunk_size=4096, **selection):
 
 
 def session_statistics(session_or_path, *, start=0, stop=None, channel_indices=None,
-                       values="engineering", chunk_size=4096):
+                       values="engineering", chunk_size=4096, progress=None, cancelled=None):
     """Stream per-channel interval statistics; std is population std (ddof=0).
 
     ``values`` is raw (V) or engineering (the saved channel conversion). Each
@@ -440,11 +460,14 @@ def session_statistics(session_or_path, *, start=0, stop=None, channel_indices=N
     if start == stop:
         raise ValueError("统计区间至少需要一个采样点")
     count = 0
+    total_frames = stop - start
     mean = np.zeros(len(channels))
     m2 = np.zeros(len(channels))
     minimum = np.full(len(channels), np.inf)
     maximum = np.full(len(channels), -np.inf)
+    _task_progress(progress, cancelled, 0, total_frames)
     for first in range(start, stop, chunk_size):
+        _task_progress(progress, cancelled, count, total_frames)
         block = session.read(first, min(chunk_size, stop - first))[:, columns]
         if values == "engineering":
             block = convert_volts(block, channels)
@@ -464,6 +487,7 @@ def session_statistics(session_or_path, *, start=0, stop=None, channel_indices=N
         count = total
         minimum = np.minimum(minimum, np.min(block, axis=0))
         maximum = np.maximum(maximum, np.max(block, axis=0))
+        _task_progress(progress, cancelled, count, total_frames)
     std = np.sqrt(m2 / count)
     rms = np.hypot(mean, std)
     return [{"index": channel.index, "name": channel.name,

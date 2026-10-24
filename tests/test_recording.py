@@ -7,8 +7,72 @@ import numpy as np
 import pytest
 
 from labdaq.processing import ChannelSettings, convert_volts
-from labdaq.recording import (SessionRecorder, export_csv, export_txt, load_session,
+from labdaq.recording import (OperationCancelled, SessionRecorder, export_csv, export_txt, load_session,
                              next_recording_path, session_statistics)
+
+
+def test_export_progress_reaches_total_without_changing_values(tmp_path):
+    session, _, raw = _selected_recording(tmp_path)
+    calls = []
+    destination = export_csv(session, tmp_path / "progress.csv", chunk_size=3,
+                             start=2, stop=10, channel_indices=[2, 3], values="raw",
+                             time_format="samples", progress=lambda done, total: calls.append((done, total)))
+    assert calls[-1] == (8, 8)
+    assert calls[0] == (0, 8)
+    with destination.open(encoding="utf-8-sig", newline="") as handle:
+        handle.readline()
+        rows = list(csv.reader(handle))
+    np.testing.assert_array_equal(np.asarray(rows[1:], dtype=float)[:, 0], np.arange(2, 10))
+    np.testing.assert_array_equal(np.asarray(rows[1:], dtype=float)[:, 1:], raw[2:10, [2, 0]])
+
+
+def test_statistics_progress_reaches_total_without_changing_values(tmp_path):
+    session, _, raw = _selected_recording(tmp_path)
+    calls = []
+    result = session_statistics(session, start=2, stop=10, channel_indices=[0, 3],
+                                values="raw", chunk_size=3,
+                                progress=lambda done, total: calls.append((done, total)))
+    assert calls[-1] == (8, 8)
+    assert calls[0] == (0, 8)
+    expected = raw[2:10, [1, 0]]
+    for column, stat in enumerate(result):
+        assert stat["count"] == 8
+        assert stat["mean"] == pytest.approx(expected[:, column].mean())
+        assert stat["std"] == pytest.approx(expected[:, column].std())
+        assert stat["rms"] == pytest.approx(np.sqrt(np.mean(expected[:, column] ** 2)))
+
+
+def test_export_and_statistics_cancel_after_first_chunk(tmp_path):
+    session, _, raw = _selected_recording(tmp_path)
+    export_progress = []
+    destination = tmp_path / "cancelled.csv"
+    with pytest.raises(OperationCancelled):
+        export_csv(session, destination, chunk_size=3, start=2, stop=10,
+                   channel_indices=[0], values="raw", time_format="samples",
+                   progress=lambda done, total: export_progress.append((done, total)),
+                   cancelled=lambda: bool(export_progress) and export_progress[-1][0] >= 3)
+    with destination.open(encoding="utf-8-sig", newline="") as handle:
+        handle.readline()
+        rows = list(csv.reader(handle))
+    assert np.asarray(rows[1:], dtype=float).shape == (3, 2)
+    np.testing.assert_array_equal(np.asarray(rows[1:], dtype=float),
+                                  np.column_stack((np.arange(2, 5), raw[2:5, 1])))
+
+    statistics_progress = []
+    with pytest.raises(OperationCancelled):
+        session_statistics(session, start=2, stop=10, channel_indices=[0], values="raw",
+                           chunk_size=3,
+                           progress=lambda done, total: statistics_progress.append((done, total)),
+                           cancelled=lambda: bool(statistics_progress) and statistics_progress[-1][0] >= 3)
+    assert statistics_progress == [(0, 8), (0, 8), (3, 8)]
+
+
+def test_pre_cancelled_export_does_not_create_output(tmp_path):
+    session, _, _ = _selected_recording(tmp_path)
+    destination = tmp_path / "pre-cancelled.csv"
+    with pytest.raises(OperationCancelled):
+        export_csv(session, destination, cancelled=lambda: True)
+    assert not destination.exists()
 
 
 def test_recording_replay_preserves_voltage_order_and_partial_final_chunk(tmp_path):

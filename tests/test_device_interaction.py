@@ -193,3 +193,31 @@ def test_display_selection_sends_no_usb_commands(workbench):
     idle.stop.assert_not_called()
     idle.shutdown.assert_not_called()
     idle.detach.assert_not_called()
+
+
+def test_non_danger_messages_clear_error_banner_and_danger_can_show_again(workbench):
+    app, window = workbench
+    window.tell("模拟设备错误", "danger")
+    app.processEvents()
+    assert window.error_banner.isVisible()
+    assert window.error_details.text() == "模拟设备错误"
+
+    window.tell("设备已连接", "success")
+    app.processEvents()
+    assert not window.error_banner.isVisible()
+    window.tell("普通状态消息", "info")
+    app.processEvents()
+    assert not window.error_banner.isVisible()
+
+    window.tell("新的设备错误", "danger")
+    app.processEvents()
+    assert window.error_banner.isVisible()
+    assert window.error_details.text() == "新的设备错误"
+
+
+def test_empty_device_scan_reports_disconnected_not_protocol_simulation(workbench, monkeypatch):
+    _, window = workbench
+    monkeypatch.setattr(gui, "enumerate_usb_devices", lambda: [])
+    window.scan_devices()
+    assert "当前未连接" in window.device_result.text()
+    assert "协议模拟" not in window.device_result.text()
