@@ -317,7 +317,8 @@ class MainWindow(W.QMainWindow):
         self.latest_recording = self.engine.last_recording
         self._pending_record = self.latest_recording if self.engine.recording else None
         group = p["recording_options"].get("group_number", 0)
-        self.recording_sequence.setValue(group if self.engine.recording else group + 1)
+        # The Rust core now persists the next number after a normal completion.
+        self.recording_sequence.setValue(max(1, group))
         # Reconnect is read-only: changing the input selector must not stop the core.
         self.scenario.blockSignals(True)
         self.scenario.setCurrentIndex(self.scenario.findData("usb" if self.engine.source == "usb" else "rust"))
@@ -2510,12 +2511,10 @@ class MainWindow(W.QMainWindow):
             return
         self.timer.stop()
         if isinstance(self.engine, RemoteEngine):
-            if (not self.engine.running and not self.engine.output.get("running", False)
-                    and not self.engine.connection_error):
-                try:
-                    self.engine.shutdown()
-                except (OSError, ValueError, RuntimeError):
-                    pass  # Window closure must never stop an unknown active record.
+            try:
+                self.engine.shutdown_if_idle()
+            except (OSError, ValueError, RuntimeError):
+                pass  # Window closure must never stop an unknown active record.
             self.engine.detach()
         elif self.engine:
             self.engine.stop()

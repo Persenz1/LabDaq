@@ -27,7 +27,13 @@ pub fn modify(address: u16, mask: u16, value: u16) -> [u8; 64] {
 }
 
 pub fn subsystem(start: bool) -> [u8; 64] {
-    packet(if start { 30 } else { 31 }, &[0; 6]) // ADC, internal clock, immediate trigger
+    subsystem_triggered(start, 0)
+}
+
+pub fn subsystem_triggered(start: bool, trigger_flags: u16) -> [u8; 64] {
+    let mut payload = [0; 6]; // uint32 subsystem followed by uint16 flags.
+    payload[4..].copy_from_slice(&trigger_flags.to_le_bytes());
+    packet(if start { 30 } else { 31 }, &payload)
 }
 
 pub fn eeprom(offsets: &[u8]) -> [u8; 64] {
@@ -223,6 +229,10 @@ mod tests {
         );
         assert_eq!(&eeprom(&[5, 6])[..9], &[12, 0, 0, 0, 2, 0x50, 5, 0x50, 6]);
         assert_eq!(&subsystem(true)[..10], &[30, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            &subsystem_triggered(true, 1)[..10],
+            &[30, 0, 0, 0, 0, 0, 0, 0, 1, 0]
+        );
         let p = plan_clock(48000.0).unwrap();
         assert_eq!(p.actual_rate, 48000.0);
         assert_eq!(

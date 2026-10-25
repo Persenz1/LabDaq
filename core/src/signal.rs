@@ -26,9 +26,24 @@ impl Signals {
     pub fn validate(&self) -> Result<(), String> {
         for s in &self.channels {
             if ![
-                "dc", "sine", "square", "triangle", "sawtooth", "step", "pulse", "chirp", "noise",
+                s.amplitude_v,
+                s.offset_v,
+                s.frequency_hz,
+                s.phase_deg,
+                s.noise_rms_v,
+                s.drift_v_per_s,
+                s.duty_cycle,
+                s.start_s,
+                s.duration_s,
+                s.end_frequency_hz,
             ]
-            .contains(&s.waveform.as_str())
+            .iter()
+            .all(|x| x.is_finite())
+                || ![
+                    "dc", "sine", "square", "triangle", "sawtooth", "step", "pulse", "chirp",
+                    "noise",
+                ]
+                .contains(&s.waveform.as_str())
                 || s.noise_rms_v < 0.0
                 || s.frequency_hz < 0.0
                 || s.end_frequency_hz < 0.0

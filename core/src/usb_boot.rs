@@ -4,9 +4,34 @@
 use crate::{dt9837 as dt, usb_input::Fault};
 use rusb::{Context, Device, DeviceHandle, UsbContext};
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
+
+static FIRMWARE_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+pub fn set_firmware_path(path: PathBuf) {
+    let _ = FIRMWARE_PATH.set(path);
+}
+
+fn firmware_path() -> PathBuf {
+    if let Some(path) = FIRMWARE_PATH.get() {
+        return path.clone();
+    }
+    if let Some(path) = std::env::var_os("LABDAQ_FIRMWARE") {
+        return path.into();
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(folder) = exe.parent() {
+            let path = folder.join("resources/firmware/dt9837-ram.json");
+            if path.exists() {
+                return path;
+            }
+        }
+    }
+    PathBuf::from("resources/firmware/dt9837-ram.json")
+}
 
 #[derive(Deserialize)]
 struct Record {
@@ -60,13 +85,17 @@ fn read_firmware(path: &Path) -> Result<Firmware, Fault> {
         Fault::new(
             "firmware_required",
             format!(
-                "无法读取 {}：{e}；请先运行 tools/prepare_usb_firmware.py",
+                "无法读取 {}：{e}；请修复 LabDAQ 安装中的冷启动固件资源，或通过 --firmware 指定资源文件",
                 path.display()
             ),
         )
     })?;
+    parse_firmware(&bytes)
+}
+
+fn parse_firmware(bytes: &[u8]) -> Result<Firmware, Fault> {
     let f: Firmware =
-        serde_json::from_slice(&bytes).map_err(|e| Fault::new("firmware_error", e.to_string()))?;
+        serde_json::from_slice(bytes).map_err(|e| Fault::new("firmware_error", e.to_string()))?;
     if f.format != "dt9837-ram-v1"
         || f.loader.is_empty()
         || f.runtime.is_empty()
@@ -85,7 +114,7 @@ fn read_firmware(path: &Path) -> Result<Firmware, Fault> {
 }
 
 pub fn load(ctx: &Context, device: Device<Context>) -> Result<Device<Context>, Fault> {
-    let firmware = read_firmware(Path::new("resources/firmware/dt9837-ram.json"))?;
+    let firmware = read_firmware(&firmware_path())?;
     let bus = device.bus_number();
     let ports = device
         .port_numbers()
@@ -140,15 +169,33 @@ pub fn load(ctx: &Context, device: Device<Context>) -> Result<Device<Context>, F
 mod tests {
     use super::*;
     #[test]
+    #[ignore = "requires separately supplied local firmware resource"]
     fn local_firmware_has_expected_two_stages() {
         let path = Path::new("../resources/firmware/dt9837-ram.json");
-        if !path.exists() {
-            return;
-        } // Local-only firmware is not distributed with sources.
         let f = read_firmware(path).unwrap();
         assert_eq!(f.loader.len(), 59);
         assert_eq!(f.runtime.len(), 1034);
         assert!(f.runtime.iter().any(|r| r.address > 0x1b3f));
         assert!(f.runtime.iter().any(|r| r.address <= 0x1b3f));
+    }
+
+    #[test]
+    fn firmware_parser_rejects_reset_registers_empty_records_and_address_overflow() {
+        let template = serde_json::json!({"format":"dt9837-ram-v1","loader":[{"address":0,"data":[1,2]}],"runtime":[{"address":8192,"data":[3]}]});
+        assert!(parse_firmware(&serde_json::to_vec(&template).unwrap()).is_ok());
+        for record in [
+            serde_json::json!({"address":0,"data":[]}),
+            serde_json::json!({"address":0x7f91,"data":[1,2]}),
+            serde_json::json!({"address":0xe600,"data":[1]}),
+            serde_json::json!({"address":65535,"data":[1,2]}),
+        ] {
+            let mut bad = template.clone();
+            bad["runtime"][0] = record;
+            assert!(parse_firmware(&serde_json::to_vec(&bad).unwrap()).is_err());
+        }
+        let mut bad = template.clone();
+        bad["loader"][0]["address"] = serde_json::json!(8192);
+        assert!(parse_firmware(&serde_json::to_vec(&bad).unwrap()).is_err());
+        assert!(parse_firmware(b"not json").is_err());
     }
 }

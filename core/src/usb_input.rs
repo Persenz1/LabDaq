@@ -1,7 +1,7 @@
 //! Single-owner DT9837C USB input. ADC and status reads run independently of IPC.
 use crate::{Config, dt9837 as dt};
 use rusb::{Context, DeviceHandle, UsbContext};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -67,6 +67,36 @@ pub struct DeviceInfo {
     pub channel_select: u16,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DeviceSelector {
+    #[serde(default)]
+    pub bus: u8,
+    #[serde(default)]
+    pub ports: Vec<u8>,
+    #[serde(default)]
+    pub vendor_name: Option<String>,
+}
+
+/// Enumeration does not claim interfaces, initialize a device, or start output.
+pub fn enumerate() -> Result<Vec<serde_json::Value>, Fault> {
+    let context = Context::new().map_err(|e| Fault::usb("初始化 USB 枚举", e))?;
+    let devices = context.devices().map_err(|e| Fault::usb("枚举 USB", e))?;
+    let mut found = Vec::new();
+    for device in devices.iter() {
+        let d = device
+            .device_descriptor()
+            .map_err(|e| Fault::usb("读取 USB 描述符", e))?;
+        if d.vendor_id() == dt::VENDOR && [dt::BOOT, dt::RUNTIME].contains(&d.product_id()) {
+            found.push(serde_json::json!({"bus":device.bus_number(),
+                "ports":device.port_numbers().map_err(|e|Fault::usb("读取 USB 端口",e))?,
+                "vendor_id":d.vendor_id(),"product_id":d.product_id(),
+                "state":if d.product_id()==dt::BOOT {"cold"} else {"runtime"},
+                "model":"DT9837 family; C subtype verified on connection"}));
+        }
+    }
+    Ok(found)
+}
+
 pub(crate) fn write(handle: &DeviceHandle<Context>, data: &[u8; 64]) -> Result<(), Fault> {
     let n = handle
         .write_bulk(0x01, data, COMMAND_TIMEOUT)
@@ -130,7 +160,7 @@ pub struct UsbInput {
 }
 
 impl UsbInput {
-    pub fn connect() -> Result<Self, Fault> {
+    pub fn connect_selected(selector: Option<&DeviceSelector>) -> Result<Self, Fault> {
         let ctx = Context::new().map_err(|e| Fault::usb("初始化 libusb", e))?;
         let devices = ctx.devices().map_err(|e| Fault::usb("枚举 USB", e))?;
         let mut matches = Vec::new();
@@ -139,6 +169,16 @@ impl UsbInput {
                 .device_descriptor()
                 .map_err(|e| Fault::usb("读取 USB 描述符", e))?;
             if d.vendor_id() == dt::VENDOR && [dt::BOOT, dt::RUNTIME].contains(&d.product_id()) {
+                if let Some(s) = selector {
+                    if device.bus_number() != s.bus
+                        || device
+                            .port_numbers()
+                            .map_err(|e| Fault::usb("读取 USB 端口", e))?
+                            != s.ports
+                    {
+                        continue;
+                    }
+                }
                 matches.push((device, d.product_id()));
             }
         }
@@ -146,7 +186,7 @@ impl UsbInput {
             return Err(Fault::new(
                 "device_selection",
                 format!(
-                    "检测到 {} 台 DT9837 系列设备；当前仅支持连接一台",
+                    "检测到 {} 台匹配的 DT9837 系列设备；请选择明确的 USB 总线和端口路径",
                     matches.len()
                 ),
             ));
@@ -240,7 +280,13 @@ impl UsbInput {
         Ok(input)
     }
 
-    pub fn start(&mut self, config: &Config) -> Result<(), Fault> {
+    pub fn start(
+        &mut self,
+        config: &Config,
+        external_rising: bool,
+        sync_mode: &str,
+        defer_start: bool,
+    ) -> Result<(), Fault> {
         if self.started || !self.workers.is_empty() {
             return Err(Fault::new("configuration_error", "设备已经开始采集"));
         }
@@ -255,10 +301,17 @@ impl UsbInput {
         let (sender, blocks) = mpsc::sync_channel(QUEUE_BLOCKS);
         input.blocks = blocks;
         input.stopping = Arc::new(AtomicBool::new(false));
-        input.fault = Arc::new(Mutex::new(None));
+        if let Some(error) = input.fault.lock().unwrap().clone() {
+            return Err(error);
+        }
         input.actual_rate = plan.actual_rate;
         // Independent internal timebase; allow PLL lock and 128 samples to settle.
-        modify(h, 0, 3, 0)?;
+        let sync = match sync_mode {
+            "master" => 2,
+            "slave" => 1,
+            _ => 0,
+        };
+        modify(h, 0, 3, sync)?;
         thread::sleep(Duration::from_secs_f64(128.0 / plan.actual_rate + 0.003));
         modify(h, 1, 2, 2)?;
         let mut control2 = 0;
@@ -302,7 +355,7 @@ impl UsbInput {
         input.info.control1 = read_word(h, 1)?;
         input.info.control2 = read_word(h, 2)?;
         input.info.channel_select = read_word(h, 0x10)?;
-        if input.info.control0 & 0x0303 != plan.divider_register
+        if input.info.control0 & 0x0303 != (plan.divider_register | sync)
             || input.info.control1 & 1 != u16::from(plan.high_speed)
             || input.info.control2 & 0x0fff != control2
             || input.info.channel_select & 0xff != select
@@ -336,7 +389,9 @@ impl UsbInput {
                 match message_handle.read_bulk(0x88, &mut bytes, READ_TIMEOUT) {
                     Err(rusb::Error::Timeout) | Ok(0) => {} // Idle status endpoint is normal.
                     Ok(n) => {
-                        if let Some(error) = message_fault(&bytes[..n], output_active.load(Ordering::Acquire)) {
+                        if let Some(error) =
+                            message_fault(&bytes[..n], output_active.load(Ordering::Acquire))
+                        {
                             set_fault(&fault, error);
                             break;
                         }
@@ -369,10 +424,27 @@ impl UsbInput {
             fault,
             sender,
             no_data_timeout,
+            external_rising || sync_mode == "slave" || defer_start,
         )?);
         input.started = true;
-        write(h, &dt::subsystem(true))?;
+        if !defer_start {
+            write(
+                h,
+                &dt::subsystem_triggered(true, if external_rising { 1 } else { 0 }),
+            )?;
+        }
         Ok(())
+    }
+
+    pub fn arm(&self, external_rising: bool) -> Result<(), Fault> {
+        let h = self
+            .handle
+            .as_ref()
+            .ok_or_else(|| Fault::new("device_disconnected", "设备尚未连接"))?;
+        write(
+            h,
+            &dt::subsystem_triggered(true, if external_rising { 1 } else { 0 }),
+        )
     }
 
     pub fn error(&self) -> Option<Fault> {
@@ -380,15 +452,22 @@ impl UsbInput {
     }
 
     pub fn start_output(&mut self, settings: crate::output::Settings) -> Result<(), Fault> {
-        self.output.start(self.handle.as_ref().unwrap(), settings, self.fault.clone())
+        self.output
+            .start(self.handle.as_ref().unwrap(), settings, self.fault.clone())
     }
 
     pub fn stop_output(&mut self) -> Result<(), Fault> {
-        self.output.stop(self.handle.as_ref().ok_or_else(|| Fault::new("device_disconnected", "设备尚未连接"))?)
+        self.output.stop(
+            self.handle
+                .as_ref()
+                .ok_or_else(|| Fault::new("device_disconnected", "设备尚未连接"))?,
+        )
     }
 
     pub fn check_connection(&self) -> Result<(), Fault> {
-        let handle = self.handle.as_ref()
+        let handle = self
+            .handle
+            .as_ref()
             .ok_or_else(|| Fault::new("device_disconnected", "设备尚未连接"))?;
         read_word(handle, 0).map(|_| ())
     }
@@ -398,7 +477,9 @@ impl UsbInput {
         if let Some(h) = &self.handle {
             if self.started {
                 let stop_error = write(h, &dt::subsystem(false)).err();
-                if error.is_none() { error = stop_error; }
+                if error.is_none() {
+                    error = stop_error;
+                }
                 self.started = false;
             }
             self.stopping.store(true, Ordering::Release);
@@ -416,7 +497,9 @@ impl UsbInput {
         if let Some(h) = &self.handle {
             if self.output.status.running || !self.output.status.zeroed {
                 let output_error = self.output.stop(h).err();
-                if error.is_none() { error = output_error; }
+                if error.is_none() {
+                    error = output_error;
+                }
             }
             if self.powered {
                 if let Err(e) = write(h, &dt::packet(52, &[0])) {
@@ -452,7 +535,8 @@ fn message_fault(bytes: &[u8], output_active: bool) -> Option<Fault> {
             "设备 ADC FIFO 溢出，数据连续性中断",
         )),
         6..=8 if output_active => Some(Fault::new(
-            "output_error", "设备报告 AO 欠载、过采样或意外结束，输入与输出已停止",
+            "output_error",
+            "设备报告 AO 欠载、过采样或意外结束，输入与输出已停止",
         )),
         1..=8 => None,
         code => Some(Fault::new(
@@ -479,6 +563,9 @@ mod tests {
         assert!(message_fault(&[5], false).is_some());
         assert!(message_fault(&99u32.to_le_bytes(), false).is_some());
         assert!(message_fault(&6u32.to_le_bytes(), false).is_none());
-        assert_eq!(message_fault(&6u32.to_le_bytes(), true).unwrap().reason, "output_error");
+        assert_eq!(
+            message_fault(&6u32.to_le_bytes(), true).unwrap().reason,
+            "output_error"
+        );
     }
 }

@@ -1,0 +1,15 @@
+[package]
+name = "labdaq-setup"
+version.workspace = true
+edition.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "LabDAQ-Setup"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "=0.33.3", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+serde_json = "1"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Devices_DeviceAndDriverInstallation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_System_Registry"] }

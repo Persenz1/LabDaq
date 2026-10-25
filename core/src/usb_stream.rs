@@ -110,6 +110,7 @@ pub fn spawn(
     fault: Arc<Mutex<Option<Fault>>>,
     blocks: SyncSender<Vec<f64>>,
     timeout: Duration,
+    wait_for_first_data: bool,
 ) -> Result<JoinHandle<()>, Fault> {
     let (ready, wait_ready) = mpsc::sync_channel(1);
     let worker = thread::spawn(move || {
@@ -219,7 +220,9 @@ pub fn spawn(
             for item in completed_rx.try_iter() {
                 received_at = process(item);
             }
-            if received_at.elapsed() > timeout {
+            if received_at.elapsed() > timeout
+                && (!wait_for_first_data || shared.sequence.load(Ordering::Relaxed) > 8)
+            {
                 set_fault(
                     &shared.fault,
                     Fault::new("data_timeout", "ADC 数据超时，已停止本次采集"),

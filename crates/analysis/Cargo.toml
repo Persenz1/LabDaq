@@ -1,0 +1,10 @@
+[package]
+name = "labdaq-analysis"
+version = "0.2.0"
+edition = "2024"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+num-complex = "0.4"
+rustfft = "6"

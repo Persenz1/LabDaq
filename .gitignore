@@ -1,12 +1,14 @@
 # All reference resources remain local: vendor packages, firmware, manuals,
 # downloaded source archives, sample data and hardware photographs.
 /resources/
+/installer/vendor/OEM-LICENSE.rtf
 
 # Local extraction / reading intermediates.
 /.work/
 /.task-tmp/
 /.runtime/
 /core/target/
+/target/
 
 # Local Codex/Gemini discussion; never publish to GitHub.
 /.local-collab/

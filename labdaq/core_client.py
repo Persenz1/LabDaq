@@ -21,7 +21,10 @@ from .protocol import AcquisitionConfig, plan_clock
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ENDPOINT = ROOT / ".runtime" / "core.json"
-CORE_EXE = ROOT / "core" / "target" / "release" / ("labdaq-core.exe" if os.name == "nt" else "labdaq-core")
+_CORE_NAME = "labdaq-core.exe" if os.name == "nt" else "labdaq-core"
+CORE_EXE = ROOT / "target" / "release" / _CORE_NAME
+if not CORE_EXE.is_file():
+    CORE_EXE = ROOT / "core" / "target" / "release" / _CORE_NAME
 
 
 class CoreClient:
@@ -269,3 +272,6 @@ class RemoteEngine:
     def shutdown(self):
         self._call("shutdown")
         self.detach()
+
+    def shutdown_if_idle(self):
+        self._call("shutdown_if_idle")
