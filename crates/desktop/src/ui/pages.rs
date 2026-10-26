@@ -355,28 +355,32 @@ impl LabDaqApp {
                 self.settings.devices =
                     vec![json!({"bus":0,"ports":[1]}), json!({"bus":0,"ports":[2]})];
             }
-        } else if ui.button("发现 USB 数采").clicked() {
+        } else if ui.button("发现原厂数采").clicked() {
             self.command(json!({"op":"list_devices"}));
         }
         for device in self.devices_found.clone() {
-            let selector = json!({"bus":device["bus"],"ports":device["ports"]});
+            let vendor = device["vendor_name"].as_str().unwrap_or("");
+            let selector = if vendor.is_empty() {
+                json!({"bus":device["bus"],"ports":device["ports"]})
+            } else {
+                json!({"vendor_name":vendor})
+            };
             let mut selected = self.settings.devices.contains(&selector);
-            if ui
-                .checkbox(
-                    &mut selected,
-                    format!(
-                        "总线 {} · 端口 {} · {}",
-                        device["bus"],
-                        device["ports"],
-                        if device["state"] == "cold" {
-                            "冷启动"
-                        } else {
-                            "运行态"
-                        }
-                    ),
+            let label = if vendor.is_empty() {
+                format!(
+                    "总线 {} · 端口 {} · {}",
+                    device["bus"],
+                    device["ports"],
+                    if device["state"] == "cold" {
+                        "冷启动"
+                    } else {
+                        "运行态"
+                    }
                 )
-                .changed()
-            {
+            } else {
+                format!("{} · {} · {}", vendor, device["model"], device["driver"])
+            };
+            if ui.checkbox(&mut selected, label).changed() {
                 if selected {
                     self.settings.devices.push(selector);
                 } else {

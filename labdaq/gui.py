@@ -18,7 +18,7 @@ from .ui_kit import (CollapsibleSection, METRIC_VALUE_MODES, MetricCard, card, c
                      field, field_label, label, legend_chip, section_title,
                      status_chip, status_dot)
 from .engine import AcquisitionEngine
-from .core_client import DEFAULT_ENDPOINT, RemoteEngine
+from .core_client import DEFAULT_ENDPOINT, RemoteEngine, enumerate_vendor_devices
 from .inputs import HpfReplaySession
 from .signals import SimulationSettings
 from .input_dialog import SignalDialog
@@ -91,7 +91,7 @@ class DeviceConnectionWorker(QtCore.QThread):
 
     def run(self):
         try:
-            if self.scan_first and not enumerate_usb_devices():
+            if self.scan_first and not enumerate_vendor_devices(self.parameters["endpoint"]):
                 return
             self.engine = RemoteEngine.start_new(**self.parameters, source="usb", connect_only=True)
         except (OSError, ValueError, RuntimeError) as exc:
@@ -686,7 +686,7 @@ class MainWindow(W.QMainWindow):
         self.scenario.addItem("可配置电信号 · 电压模拟", "custom")
         self.scenario.addItem("原始 HPF · 按时间回放", "hpf")
         self.scenario.addItem("独立核心 · 电信号模拟", "rust")
-        self.scenario.addItem("DT9837C · 真实 USB 输入", "usb")
+        self.scenario.addItem("DT9837C · 原厂驱动输入", "usb")
         self.scenario.setCurrentIndex(self.scenario.findData("usb"))
         inputs.addWidget(field("输入来源", self.scenario))
         self.input_button = button("配置电信号", self.edit_input)
@@ -1018,10 +1018,10 @@ class MainWindow(W.QMainWindow):
         left = W.QVBoxLayout()
         left.setSpacing(10)
         left.addWidget(label("真实输入由独立核心连接 DT9837C。选择真实输入后可先连接设备，再开始预览；"
-                             "停止采集保持连接，断开设备关闭工作电源。扫描不改变设备配置。", "notice", True))
+                             "停止采集保持连接，断开设备释放原厂驱动会话。扫描不改变设备配置。", "notice", True))
         row = W.QHBoxLayout()
         row.setSpacing(8)
-        scan = button("查找 DT USB 设备", self.scan_devices, "primary")
+        scan = button("开发 USB 描述符扫描", self.scan_devices, "primary")
         scan.setIcon(theme.icon("refresh", self.p.accent_text, 15))
         boot = button("冷启动离线验证", self.simulate_boot)
         boot.setIcon(theme.icon("play", self.p.text_muted, 15))
@@ -1038,7 +1038,7 @@ class MainWindow(W.QMainWindow):
         left.addStretch()
         right = W.QVBoxLayout()
         right.setSpacing(8)
-        self.device_result = label("尚未扫描 · 扫描只读取设备描述符，不更换驱动或初始化设备。", "muted", True)
+        self.device_result = label("开发诊断：PyUSB 扫描不代表原厂连接状态；正常采集无需 WinUSB。只读扫描，不更换驱动。", "muted", True)
         right.addWidget(self.device_result)
         self.boot_result = label("冷启动验证使用已归档固件记录，只在内存中模拟 RAM 写入与重新枚举。", "muted", True)
         right.addWidget(self.boot_result)
@@ -1264,7 +1264,7 @@ class MainWindow(W.QMainWindow):
                 raise RuntimeError("请先停止采集，再断开设备")
             if isinstance(self.engine, RemoteEngine) and self.engine.device_connected:
                 self.engine.disconnect()
-                self.tell("设备已断开，工作电源已关闭。")
+                self.tell("设备已断开。")
             else:
                 self.reconnect_device()
         except (OSError, ValueError, RuntimeError) as exc:
@@ -1366,7 +1366,7 @@ class MainWindow(W.QMainWindow):
             if recording_path:
                 self.latest_recording = recording_path
             self.actual_rate.setText(f"实际时钟：{self.engine.sample_rate:,.3f} S/s")
-            self.actual_rate.setToolTip("HPF 文件保存的原始采样率，不重新取整。" if mode == "hpf" else "PLL 寄存器计算的名义采样率；未进行外部时钟校准。")
+            self.actual_rate.setToolTip("HPF 文件保存的原始采样率，不重新取整。" if mode == "hpf" else "原厂 Open Layers 回读的实际采样率；未进行外部时钟校准。" if mode == "usb" else "PLL 寄存器计算的名义采样率；未进行外部时钟校准。")
             self.pause_plot.setChecked(False)
             self._update_live_window_limit()
             self._fit_live_plot()
@@ -1463,7 +1463,7 @@ class MainWindow(W.QMainWindow):
         self.reconnect_button.setVisible(self.scenario.currentData() == "usb")
         self.reconnect_button.setText("断开设备" if connected else "重新连接")
         self.reconnect_button.setEnabled(not running and not self._connecting)
-        self.reconnect_button.setToolTip("停止采集后断开数采并关闭工作电源。" if connected else
+        self.reconnect_button.setToolTip("停止采集后断开数采并释放原厂驱动会话。" if connected else
                                          "重新连接数采并进入待机，不会开始采集或记录。")
         from_hpf = self.scenario.currentData() == "hpf"
         hardware_ready = self.scenario.currentData() != "usb" or connected

@@ -1437,10 +1437,12 @@ dependencies = [
 name = "labdaq-core"
 version = "0.1.0"
 dependencies = [
+ "libloading",
  "rusb",
  "serde",
  "serde_json",
  "time",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

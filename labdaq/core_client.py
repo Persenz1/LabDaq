@@ -69,7 +69,7 @@ class CoreClient:
         while time.monotonic() < deadline:
             try:
                 client = cls(endpoint)
-            except FileNotFoundError:
+            except (FileNotFoundError, PermissionError):
                 client = None
             # A restarted core can bind the same port before it replaces the
             # old endpoint file. Do not send the previous process's token.
@@ -79,6 +79,11 @@ class CoreClient:
                 raise RuntimeError(f"采集核心启动失败（退出码 {process.returncode}），检查端口 {port} 是否已占用")
             time.sleep(.025)
         raise TimeoutError("采集核心未在 5 秒内就绪")
+
+
+def enumerate_vendor_devices(endpoint=DEFAULT_ENDPOINT):
+    client, _ = CoreClient.connect_or_start(endpoint)
+    return client.request("list_devices")["devices"]
 
 
 class RemoteEngine:
@@ -106,7 +111,8 @@ class RemoteEngine:
         client, state = CoreClient.connect_or_start(endpoint)
         if state["running"]:
             raise RuntimeError("核心已有采集会话，请重新打开界面接回，不能覆盖当前实验")
-        profile = {"source": source, "config": asdict(config), "actual_rate": plan_clock(config.sample_rate).actual_rate,
+        profile = {"source": "vendor" if source == "usb" else source,
+                   "config": asdict(config), "actual_rate": plan_clock(config.sample_rate).actual_rate,
                    "channels": [asdict(c) for c in channels], "signal_settings": signal_settings.to_dict(),
                    "experiment": experiment, "recording_root": str(Path(recording_root).resolve()),
                    "recording_options": recording_options or {}}
@@ -163,7 +169,8 @@ class RemoteEngine:
 
     @property
     def source(self):
-        return self.profile.get("source", "simulation")
+        source = self.profile.get("source", "simulation")
+        return "usb" if source == "vendor" else source
 
     @property
     def profile(self):

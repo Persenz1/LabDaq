@@ -1,11 +1,13 @@
-//! Independent acquisition and recording. USB input uses no vendor runtime.
+//! Independent acquisition and recording with simulation and physical input backends.
 mod dt9837;
+mod input;
 mod output;
 mod signal;
 mod trigger;
 mod usb_boot;
 mod usb_input;
 mod usb_stream;
+mod vendor_input;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -27,6 +29,7 @@ enum Source {
     #[default]
     Simulation,
     Usb,
+    Vendor,
 }
 
 fn utc_now() -> String {
@@ -146,7 +149,7 @@ impl Profile {
             &c.ranges,
             self.actual_rate,
             target,
-            self.source == Source::Usb,
+            self.source != Source::Simulation,
         )?;
         if self.source == Source::Simulation {
             self.signal_settings.validate()
@@ -185,6 +188,9 @@ impl Recorder {
             Source::Usb => json!({"backend": "rust-usb-v1", "device": p.device,
                 "startup_discard_scans": dt9837::GROUP_DELAY, "adc_encoding": "offset-binary-24-in-u32-le",
                 "timebase": "hardware-sample-index", "continuity": "no-device-sequence-counter"}),
+            Source::Vendor => json!({"backend": "dt-open-layers-c-abi", "device": p.device,
+                "adc_encoding": "open-layers-24-bit-to-f64-volts",
+                "timebase": "hardware-sample-index", "continuity": "open-layers-buffer-stream"}),
         };
         let channels: Vec<_> = p.config.channels.iter().map(|i| &p.channels[*i]).collect();
         let metadata = json!({"format": "labdaq-raw-voltage", "format_version": 1,
@@ -292,7 +298,10 @@ impl Recorder {
 #[derive(Clone, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum Command {
-    ListDevices,
+    ListDevices {
+        #[serde(default)]
+        source: Option<Source>,
+    },
     StartCollection {
         profiles: Vec<Profile>,
         #[serde(default)]
@@ -373,7 +382,7 @@ struct SimulatedOutput {
 }
 
 struct State {
-    usb: Option<usb_input::UsbInput>,
+    input: Option<input::Input>,
     profile: Option<Profile>,
     running: bool,
     acquisition_started_at_utc: Option<String>,
@@ -401,7 +410,7 @@ struct State {
 impl State {
     fn new() -> Self {
         Self {
-            usb: None,
+            input: None,
             profile: None,
             running: false,
             acquisition_started_at_utc: None,
@@ -431,7 +440,7 @@ impl State {
         if let Some(devices) = &self.collection {
             return json!({"pid":std::process::id(),"running":self.running,"recording":devices.iter().any(|d|d.recorder.is_some()),
                 "recording_paused":devices.iter().all(|d|d.recording_paused),"profile":self.profile,
-                "device_connected":devices.iter().all(|d|d.usb.is_some()),"output":devices.first().map(|d|d.poll(0.,None)["output"].clone()),
+                "device_connected":devices.iter().all(|d|d.input.is_some()),"output":devices.first().map(|d|d.poll(0.,None)["output"].clone()),
                 "total_scans":devices.iter().map(|d|d.total_scans).min().unwrap_or(0),
                 "recorded_scans":devices.iter().map(|d|d.recorded_scans).min().unwrap_or(0),
                 "error":self.error,"termination_reason":self.termination_reason,"raw":[],
@@ -454,8 +463,8 @@ impl State {
         json!({"pid": std::process::id(), "running": self.running, "recording": self.recorder.is_some(),
             "recording_paused": self.recording_paused,
             "acquisition_started_at_utc": self.acquisition_started_at_utc,
-            "profile": self.profile, "device_connected": self.usb.is_some(),
-            "output": self.usb.as_ref().map(|u| &u.output.status).or_else(||self.simulated_output.as_ref().map(|s|&s.status)),
+            "profile": self.profile, "device_connected": self.input.is_some(),
+            "output": self.input.as_ref().map(|u| u.output_status()).or_else(||self.simulated_output.as_ref().map(|s|&s.status)),
             "total_scans": self.total_scans, "recorded_scans": self.recorded_scans,
             "recording_target_scans": self.recording_target_scans,
             "recording_remaining_scans": self.recording_remaining_scans,
@@ -495,7 +504,7 @@ impl State {
                 .recording_options
                 .target_scans(p.actual_rate)?
                 .ok_or("触发记录需要有限时长")?;
-            if p.source == Source::Usb
+            if p.source != Source::Simulation
                 && p.trigger.mode == "external_rising"
                 && self.total_scans > 0
             {
@@ -507,7 +516,7 @@ impl State {
                 target,
                 p.actual_rate,
                 self.total_scans,
-                p.source == Source::Usb && p.trigger.mode == "external_rising",
+                p.source != Source::Simulation && p.trigger.mode == "external_rising",
             ));
             self.trigger_base_path = Some(path);
             self.recorded_scans = 0;
@@ -530,9 +539,9 @@ impl State {
             self.acquisition_started_at_utc.as_deref(),
         )?;
         recorder.metadata["analog_output_at_start"] = json!(
-            self.usb
+            self.input
                 .as_ref()
-                .map(|u| &u.output.status)
+                .map(|u| u.output_status())
                 .or_else(|| self.simulated_output.as_ref().map(|s| &s.status))
         );
         recorder.metadata["analog_output_events"] = json!([]);
@@ -592,10 +601,10 @@ impl State {
         !self.running
             && self.recorder.is_none()
             && self.trigger.as_ref().is_none_or(|t| t.finished)
-            && self.usb.as_ref().is_none_or(|u| {
-                !u.output.status.running
-                    && !u.output.active.load(std::sync::atomic::Ordering::Acquire)
-            })
+            && self
+                .input
+                .as_ref()
+                .is_none_or(|u| !u.output_status().running && !u.output_active())
             && self
                 .simulated_output
                 .as_ref()
@@ -607,8 +616,8 @@ impl State {
     }
 
     fn refresh_outputs(&mut self) {
-        if let Some(usb) = &mut self.usb {
-            usb.output.refresh();
+        if let Some(usb) = &mut self.input {
+            usb.refresh_output();
         }
         if let Some(s) = &mut self.simulated_output {
             if s.status.running
@@ -696,15 +705,17 @@ impl State {
                     return Ok(self.poll(0., None));
                 }
                 Command::DeviceCommand { .. }
-                | Command::ListDevices
+                | Command::ListDevices { .. }
                 | Command::PreviewOutput { .. }
                 | Command::StartCollection { .. } => {}
                 _ => return Err("多设备会话请使用集体控制，或 device_command 指定设备".into()),
             }
         }
         match command {
-            Command::ListDevices => {
-                return Ok(json!({"devices":usb_input::enumerate().map_err(|e|e.to_string())?}));
+            Command::ListDevices { source } => {
+                let devices = input::enumerate(source.unwrap_or(Source::Vendor))
+                    .map_err(|e| e.to_string())?;
+                return Ok(json!({"devices":devices}));
             }
             Command::StartCollection {
                 profiles,
@@ -745,8 +756,8 @@ impl State {
                 seconds,
                 after_scan,
             } => {
-                if let Some(usb) = &mut self.usb {
-                    usb.output.refresh();
+                if let Some(usb) = &mut self.input {
+                    usb.refresh_output();
                 }
                 if let Some(s) = &mut self.simulated_output {
                     if s.status.running
@@ -761,18 +772,18 @@ impl State {
                         s.status.completed = true;
                     }
                 }
-                if let Some(error) = self.usb.as_ref().and_then(|u| u.error()) {
+                if let Some(error) = self.input.as_ref().and_then(|u| u.error()) {
                     self.fail(error);
                     self.stop_input(false);
                     self.finish_recording()?;
                 }
                 if !self.running
-                    && self.usb.is_some()
+                    && self.input.is_some()
                     && self.last_device_check.elapsed() >= Duration::from_millis(500)
                 {
                     self.last_device_check = Instant::now();
                     if let Some(error) = self
-                        .usb
+                        .input
                         .as_ref()
                         .and_then(|usb| usb.check_connection().err())
                     {
@@ -783,21 +794,21 @@ impl State {
                 return Ok(self.poll(seconds, after_scan));
             }
             Command::Connect { mut profile } => {
-                if self.running || self.usb.is_some() {
+                if self.running || self.input.is_some() {
                     return Err("核心已在采集或设备已经连接，请接回当前会话".into());
                 }
                 profile.validate()?;
-                if profile.source != Source::Usb {
-                    return Err("连接设备只适用于真实 USB 输入".into());
+                if profile.source == Source::Simulation {
+                    return Err("连接设备只适用于物理输入".into());
                 }
-                let usb = usb_input::UsbInput::connect_selected(profile.device_selector.as_ref())
+                let usb = input::Input::connect(profile.source, profile.device_selector.as_ref())
                     .map_err(|e| e.to_string())?;
                 profile.actual_rate = dt9837::plan_clock(profile.config.sample_rate)?.actual_rate;
-                profile.device = serde_json::to_value(&usb.info).unwrap();
+                profile.device = usb.info();
                 let persistence = self.persistence_path.take();
                 *self = Self::new();
                 self.persistence_path = persistence;
-                self.usb = Some(usb);
+                self.input = Some(usb);
                 self.profile = Some(*profile);
             }
             Command::Disconnect => {
@@ -818,7 +829,10 @@ impl State {
                 }
                 profile.validate()?;
                 if profile.linked_output.is_some()
-                    && (self.usb.as_ref().is_some_and(|u| u.output.status.running)
+                    && (self
+                        .input
+                        .as_ref()
+                        .is_some_and(|u| u.output_status().running)
                         || self
                             .simulated_output
                             .as_ref()
@@ -826,25 +840,25 @@ impl State {
                 {
                     return Err("请先停止现有 AO，再启动随采集联动输出".into());
                 }
-                if let Some(usb) = &self.usb {
-                    if profile.source != Source::Usb {
-                        return Err("请先断开已连接的 USB 设备，再切换到模拟输入".into());
+                if let Some(usb) = &self.input {
+                    if usb.source() != profile.source {
+                        return Err("请先断开当前设备，再切换输入后端".into());
                     }
                     if profile
                         .device_selector
                         .as_ref()
-                        .is_some_and(|s| s.bus != usb.info.bus || s.ports != usb.info.ports)
+                        .is_some_and(|s| !usb.matches_selector(s))
                     {
                         return Err("选择的设备与当前连接不同，请先断开设备".into());
                     }
                 }
                 profile.actual_rate = dt9837::plan_clock(profile.config.sample_rate)?.actual_rate;
                 // Connect/configure before replacing the previous session or creating a file.
-                let usb = if profile.source == Source::Usb {
-                    let mut usb = match self.usb.take() {
+                let usb = if profile.source != Source::Simulation {
+                    let mut usb = match self.input.take() {
                         Some(usb) => usb,
                         None => {
-                            usb_input::UsbInput::connect_selected(profile.device_selector.as_ref())
+                            input::Input::connect(profile.source, profile.device_selector.as_ref())
                                 .map_err(|e| e.to_string())?
                         }
                     };
@@ -857,8 +871,8 @@ impl State {
                         self.fail(error.clone());
                         return Err(error.to_string());
                     }
-                    profile.actual_rate = usb.actual_rate;
-                    profile.device = serde_json::to_value(&usb.info).unwrap();
+                    profile.actual_rate = usb.actual_rate();
+                    profile.device = usb.info();
                     Some(usb)
                 } else {
                     profile.device = Value::Null;
@@ -869,21 +883,20 @@ impl State {
                 *self = Self::new();
                 self.persistence_path = persistence;
                 self.simulated_output = simulated_output;
-                self.usb = usb;
+                self.input = usb;
                 self.capacity = ((profile.actual_rate * 60.0).round() as usize).clamp(1, 200000);
                 self.ring = VecDeque::with_capacity(self.capacity * profile.config.channels.len());
                 self.profile = Some(*profile);
                 self.running = true;
                 // The hardware does not timestamp its external trigger. Never turn
                 // the host arm time into a fabricated acquisition timestamp.
-                self.acquisition_started_at_utc =
-                    if self.profile.as_ref().is_some_and(|p| {
-                        p.source == Source::Usb && p.trigger.mode == "external_rising"
-                    }) {
-                        None
-                    } else {
-                        Some(utc_now())
-                    };
+                self.acquisition_started_at_utc = if self.profile.as_ref().is_some_and(|p| {
+                    p.source != Source::Simulation && p.trigger.mode == "external_rising"
+                }) {
+                    None
+                } else {
+                    Some(utc_now())
+                };
                 if let Some(settings) = self.profile.as_ref().and_then(|p| p.linked_output.clone())
                 {
                     if let Err(error) = self.command(Command::StartOutput { settings }) {
@@ -928,7 +941,7 @@ impl State {
                 settings.validate()?;
                 let profile = self.profile.as_ref().ok_or("请先连接设备或开始模拟预览")?;
                 // AO → AI0 is the current loopback wiring; excitation must remain off.
-                if profile.source == Source::Usb && profile.config.iepe[0] {
+                if profile.source != Source::Simulation && profile.config.iepe[0] {
                     return Err(
                         "AO 回接 AI0 时必须关闭 AI0 的 IEPE；请停止采集后修改通道配置".into(),
                     );
@@ -958,7 +971,7 @@ impl State {
                         started: Instant::now(),
                     });
                 } else {
-                    self.usb
+                    self.input
                         .as_mut()
                         .ok_or("设备尚未连接")?
                         .start_output(settings)
@@ -969,9 +982,9 @@ impl State {
             Command::UpdateOutput { settings } => self.update_output(settings)?,
             Command::MuteOutput { muted } => {
                 let mut settings = self
-                    .usb
+                    .input
                     .as_ref()
-                    .and_then(|u| u.output.status.settings.clone())
+                    .and_then(|u| u.output_status().settings.clone())
                     .or_else(|| {
                         self.simulated_output
                             .as_ref()
@@ -991,7 +1004,7 @@ impl State {
                     s.status.running = false;
                     s.status.zeroed = true;
                 } else {
-                    self.usb
+                    self.input
                         .as_mut()
                         .ok_or("设备尚未连接")?
                         .stop_output()
@@ -1055,7 +1068,7 @@ impl State {
         if let Some(recorder) = &mut self.recorder {
             recorder.metadata["analog_output_events"].as_array_mut().unwrap().push(json!({
                 "action": action, "requested_at_utc": utc_now(), "observed_input_scan": self.total_scans,
-                "output": self.usb.as_ref().map(|u| &u.output.status).or_else(||self.simulated_output.as_ref().map(|s|&s.status)),
+                "output": self.input.as_ref().map(|u| u.output_status()).or_else(||self.simulated_output.as_ref().map(|s|&s.status)),
             }));
         }
     }
@@ -1073,11 +1086,10 @@ impl State {
             }
             s.status.settings = Some(settings);
         } else {
-            self.usb
+            self.input
                 .as_mut()
                 .ok_or("设备尚未连接")?
-                .output
-                .update(settings)
+                .update_output(settings)
                 .map_err(|e| e.to_string())?;
         }
         self.record_output_event("update");
@@ -1111,7 +1123,7 @@ impl State {
             }
             return;
         }
-        if let Some(mut usb) = self.usb.take() {
+        if let Some(mut usb) = self.input.take() {
             let mut healthy = true;
             if let Err(e) = usb.stop() {
                 healthy = false;
@@ -1121,8 +1133,8 @@ impl State {
                 healthy = false;
                 self.fail(e);
             }
-            // Include every complete block already delivered by the USB reader.
-            for values in usb.blocks.try_iter() {
+            // Include every complete block already delivered by the input reader.
+            for values in usb.take_blocks(usize::MAX) {
                 // A partial write is the end of the valid prefix. Never append
                 // later blocks after the unwritten portion of a failed block.
                 if self.termination_reason == "write_error" {
@@ -1143,7 +1155,7 @@ impl State {
                 }
             }
             if keep_connected && healthy {
-                self.usb = Some(usb);
+                self.input = Some(usb);
             } else if let Err(error) = usb.disconnect() {
                 self.fail(error);
             }
@@ -1179,10 +1191,10 @@ impl State {
             }
             return Ok(());
         }
-        if let Some(usb) = &self.usb {
+        if let Some(usb) = &self.input {
             let error = usb.error();
             // Bound work per iteration so that control commands still get serviced.
-            let blocks: Vec<_> = usb.blocks.try_iter().take(64).collect();
+            let blocks = usb.take_blocks(64);
             for values in blocks {
                 self.accept_values(values)
                     .map_err(|message| usb_input::Fault {
@@ -1341,7 +1353,7 @@ impl State {
         mut profiles: Vec<Profile>,
         path: Option<PathBuf>,
     ) -> Result<(), String> {
-        if self.running || self.usb.is_some() || self.collection.is_some() {
+        if self.running || self.input.is_some() || self.collection.is_some() {
             return Err("请先断开当前会话，再建立多设备采集".into());
         }
         if !(2..=4).contains(&profiles.len()) {
@@ -1367,12 +1379,19 @@ impl State {
             if p.trigger.segmented() {
                 return Err("多设备集合当前支持同步连续/定长记录，触发分段请使用单设备会话".into());
             }
-            if source == Source::Usb {
+            if source != Source::Simulation {
                 let selector = p
                     .device_selector
                     .as_ref()
-                    .ok_or("多设备 USB 配置必须明确选择各台设备端口")?;
-                if !selectors.insert((selector.bus, selector.ports.clone())) {
+                    .ok_or("多设备配置必须明确选择各台设备")?;
+                if source == Source::Vendor && selector.vendor_name.is_none() {
+                    return Err("原厂多设备配置必须明确选择各台设备名".into());
+                }
+                if !selectors.insert((
+                    selector.bus,
+                    selector.ports.clone(),
+                    selector.vendor_name.clone(),
+                )) {
                     return Err("同步集合不能重复选择同一台设备".into());
                 }
             }
@@ -1400,7 +1419,7 @@ impl State {
             }
         }
         for i in (1..profiles.len()).chain(std::iter::once(0)) {
-            if let Some(usb) = &devices[i].usb {
+            if let Some(usb) = &devices[i].input {
                 if let Err(error) = usb.arm(false) {
                     for device in &mut devices {
                         device.error = error.to_string();
@@ -1530,11 +1549,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     state.error.push_str(&format!("; 保存未完成: {e}"));
                 }
             } else {
-                if state.usb.is_some()
+                if state.input.is_some()
                     || state
                         .collection
                         .as_ref()
-                        .is_some_and(|d| d.iter().any(|v| v.usb.is_some()))
+                        .is_some_and(|d| d.iter().any(|v| v.input.is_some()))
                 {
                     deadline = Instant::now() + Duration::from_millis(10);
                 } else {

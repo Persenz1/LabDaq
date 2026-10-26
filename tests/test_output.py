@@ -77,6 +77,7 @@ def test_closing_gui_detaches_idle_ai_with_active_output(workbench):
                                    actual_rate=48000, zeroed=False)
     window.engine = engine
     window.close()
+    engine.shutdown_if_idle.assert_called_once_with()
     engine.shutdown.assert_not_called()
     engine.detach.assert_called_once()
 

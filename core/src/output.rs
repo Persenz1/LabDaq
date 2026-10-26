@@ -180,7 +180,7 @@ impl Settings {
         )
     }
 
-    fn end_frame(&self, rate: f64) -> Option<u64> {
+    pub(crate) fn end_frame(&self, rate: f64) -> Option<u64> {
         let duration = self
             .duration_seconds
             .map(|t| (t * rate).round().max(1.) as u64);

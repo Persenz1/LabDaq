@@ -15,7 +15,7 @@ if (Test-Path -LiteralPath $daqVsWhere) {
 }
 $daqDevCmd = $daqVsCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 if ($daqDevCmd -and -not (Test-Path -LiteralPath (Join-Path $daqMingw 'gcc.exe'))) {
-    $daqEnvironmentLines = & cmd.exe /d /s /c "`"`"$daqDevCmd`" -arch=x64 -host_arch=x64 >nul && set`""
+    $daqEnvironmentLines = & cmd.exe /d /s /c "`"$daqDevCmd`" -arch=x64 -host_arch=x64 >nul && set"
     foreach ($daqLine in $daqEnvironmentLines) {
         if ($daqLine -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process') }
     }

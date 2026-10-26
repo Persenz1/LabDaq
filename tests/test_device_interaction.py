@@ -11,7 +11,7 @@ import pytest
 from PySide6 import QtCore, QtWidgets as W
 
 import labdaq.gui as gui
-from labdaq.core_client import RemoteEngine
+from labdaq.core_client import CoreClient, RemoteEngine
 from labdaq.processing import ChannelSettings
 from labdaq.protocol import AcquisitionConfig
 from labdaq.signals import SimulationSettings
@@ -21,7 +21,7 @@ from test_daily_workflow import spin
 def idle_engine(*, running=False):
     engine = RemoteEngine.__new__(RemoteEngine)
     engine._state = dict(
-        profile=dict(source="usb", config=asdict(AcquisitionConfig(sample_rate=5000)),
+        profile=dict(source="vendor", config=asdict(AcquisitionConfig(sample_rate=5000)),
                      actual_rate=5000, channels=[asdict(ChannelSettings(i, f"AI {i}")) for i in range(4)],
                      signal_settings=SimulationSettings().to_dict()),
         running=running, recording=False, recording_paused=False, device_connected=True,
@@ -38,6 +38,7 @@ def idle_engine(*, running=False):
     engine.stop = Mock()
     engine.detach = Mock()
     engine.shutdown = Mock()
+    engine.shutdown_if_idle = Mock()
     return engine
 
 
@@ -62,7 +63,7 @@ def workbench(tmp_path):
 def test_startup_without_device_stays_idle_and_exposes_reconnect(workbench, monkeypatch):
     app, window = workbench
     start = Mock(side_effect=AssertionError("No device must not connect"))
-    monkeypatch.setattr(gui, "enumerate_usb_devices", lambda: [])
+    monkeypatch.setattr(gui, "enumerate_vendor_devices", lambda *_: [])
     monkeypatch.setattr(RemoteEngine, "start_new", start)
     window.auto_connect_device()
     spin(app, lambda: not window._connecting)
@@ -77,7 +78,7 @@ def test_startup_connects_only_then_preview_reuses_connection(workbench, monkeyp
     idle = idle_engine()
     acquiring = idle_engine(running=True)
     start = Mock(side_effect=[idle, acquiring])
-    monkeypatch.setattr(gui, "enumerate_usb_devices", lambda: [{"product_id": 0x3998}])
+    monkeypatch.setattr(gui, "enumerate_vendor_devices", lambda *_: [{"product_id": 0x3998}])
     monkeypatch.setattr(RemoteEngine, "start_new", start)
     window.auto_connect_device()
     spin(app, lambda: not window._connecting)
@@ -239,3 +240,22 @@ def test_empty_device_scan_reports_disconnected_not_protocol_simulation(workbenc
     window.scan_devices()
     assert "当前未连接" in window.device_result.text()
     assert "协议模拟" not in window.device_result.text()
+
+
+def test_physical_profile_uses_vendor_and_keeps_gui_semantics(monkeypatch, tmp_path):
+    idle = idle_engine()
+    client = Mock()
+    client.request.return_value = idle._state
+    monkeypatch.setattr(CoreClient, "connect_or_start",
+                        classmethod(lambda cls, endpoint: (client, {"running": False})))
+    monkeypatch.setattr(RemoteEngine, "_poll", lambda self: None)
+    engine = RemoteEngine.start_new(
+        AcquisitionConfig(sample_rate=1000),
+        [ChannelSettings(i, f"AI{i}") for i in range(4)],
+        SimulationSettings(), "实验", tmp_path, source="usb", connect_only=True,
+    )
+    try:
+        assert client.request.call_args.kwargs["profile"]["source"] == "vendor"
+        assert engine.source == "usb"
+    finally:
+        engine.detach()
