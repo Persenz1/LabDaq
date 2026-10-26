@@ -13,10 +13,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
-from pathlib import Path
 from string import Template
 
 from PySide6 import QtCore, QtGui, QtWidgets as W
+from .paths import RUNTIME_DIR
 
 
 @dataclass(frozen=True)
@@ -513,7 +513,7 @@ def _draw_icon(g: QtGui.QPainter, name: str, color: str) -> None:
 
 
 _ICON_CACHE: dict[tuple[str, str, int], QtGui.QIcon] = {}
-_ASSET_DIR = Path(__file__).resolve().parents[1] / ".runtime" / "theme"
+_ASSET_DIR = RUNTIME_DIR / "theme"
 
 
 def _asset(name: str, color: str, size: int = 11) -> str:
@@ -730,6 +730,9 @@ QPushButton:hover { background: $surface_hover; border-color: $accent; color: $a
 QPushButton:pressed { background: $accent_soft; border-color: $accent; }
 QPushButton:focus { outline: none; }
 QPushButton:disabled { background: $surface_alt; color: $text_faint; border-color: $border; }
+QPushButton#aoStart[active="true"], QPushButton#aoStart[active="true"]:disabled {
+    background: $danger; color: $accent_text; border-color: $danger; font-weight: 600;
+}
 QPushButton:checked { background: $accent_soft; border-color: $accent; color: $accent; }
 
 QPushButton#primary {
@@ -806,6 +809,11 @@ QComboBox::down-arrow {
 }
 QComboBox::down-arrow:disabled { image: url($combo_arrow_disabled); }
 QComboBox { padding-right: 21px; }
+QFrame[outputControls="true"] QDoubleSpinBox,
+QFrame[outputControls="true"] QComboBox { min-height: 22px; }
+QFrame[outputControls="true"] QDoubleSpinBox QLineEdit {
+    background: transparent; border: none; border-radius: 0; padding: 0; min-height: 0;
+}
 QComboBox QAbstractItemView {
     background: $surface; border: 1px solid $border_strong; outline: 0;
     selection-background-color: $accent_soft; selection-color: $text;

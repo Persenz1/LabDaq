@@ -14,7 +14,7 @@ import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets as W
 
 from . import theme
-from .ui_kit import (CollapsibleSection, METRIC_VALUE_MODES, MetricCard, card, chip_button, divider,
+from .ui_kit import (CollapsibleSection, METRIC_VALUE_MODES, MetricCard, NoWheelComboBox, card, chip_button, divider,
                      field, field_label, label, legend_chip, section_title,
                      status_chip, status_dot)
 from .engine import AcquisitionEngine
@@ -22,7 +22,8 @@ from .core_client import DEFAULT_ENDPOINT, RemoteEngine, enumerate_vendor_device
 from .inputs import HpfReplaySession
 from .signals import SimulationSettings
 from .input_dialog import SignalDialog
-from .output_panel import OutputPanel, DEFAULT_SETTINGS as DEFAULT_OUTPUT, validate_settings as validate_output
+from .output_panel import (OutputPanel, DEFAULT_SETTINGS as DEFAULT_OUTPUT,
+                           validate_settings as validate_output, preview_waveform)
 from .processing import ChannelSettings, convert_volts, spectrum, frequency_response, filter_window
 from .protocol import AcquisitionConfig, plan_clock
 from .recording import load_session, next_recording_path, recording_directory
@@ -30,8 +31,8 @@ from .data_dialog import ExportDialog, StatisticsDialog
 from .recording_library import RecordingLibraryDialog
 from .plot_measurements import PlotMeasurements
 from .transport import enumerate_usb_devices
+from .paths import ROOT, RECORDING_ROOT
 
-ROOT = Path(__file__).resolve().parents[1]
 NAV_TITLES = ["实时采集", "信号输出", "信号分析", "数据回看", "设备与协议"]
 NAV_ICONS = ["wave", "export", "stats", "history", "chip"]
 PAGE_SUBTITLES = [
@@ -41,11 +42,6 @@ PAGE_SUBTITLES = [
     "保留原始信号，让数据可以重新查看、分析和导出。",
     "查看设备描述符、协议命令和离线冷启动流程。",
 ]
-
-
-class NoWheelComboBox(W.QComboBox):
-    def wheelEvent(self, event):
-        event.ignore()
 
 
 def button(text: str, callback=None, name="") -> W.QPushButton:
@@ -263,7 +259,7 @@ class MainWindow(W.QMainWindow):
         self.input_hpf_config = None
         self.engine: AcquisitionEngine | RemoteEngine | None = None
         self.core_endpoint = core_endpoint
-        self.recording_root = ROOT / "recordings"
+        self.recording_root = RECORDING_ROOT
         self.latest_recording: Path | None = None
         self._pending_record: Path | None = None
         self.recording_duration_seconds: float | None = None
@@ -632,21 +628,81 @@ class MainWindow(W.QMainWindow):
         return scroll
 
     def _output_page(self):
+        page = W.QWidget()
+        page.setObjectName("pageHost")
+        layout = W.QHBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(16)
+        self.output_monitor, monitor = card()
+        self.output_monitor.setMinimumWidth(360)
+        header = W.QHBoxLayout()
+        header.addWidget(section_title("波形监视", "wave"))
+        header.addStretch()
+        header.addWidget(button("适应波形", self._refresh_output_monitor, "chip"))
+        monitor.addLayout(header)
+        self.output_monitor_status = label("", "muted", True)
+        monitor.addWidget(self.output_monitor_status)
+        self.output_plot = plot_widget("输出电压", "V")
+        self.output_plot.setToolTip("按 AO 参数绘制的设定波形；实际电压可通过 AI 回采查看。")
+        self.output_plot.setMinimumHeight(300)
+        self.output_curve = self.output_plot.plot(pen=pg.mkPen(self.p.accent, width=2))
+        monitor.addWidget(self.output_plot, 1)
+        self.output_monitor_info = label("", "muted", True)
+        monitor.addWidget(self.output_monitor_info)
+        layout.addWidget(self.output_monitor, 1)
         scroll = W.QScrollArea()
         scroll.setObjectName("panelScroll")
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(W.QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         content = W.QWidget()
-        content.setObjectName("pageHost")
-        layout = W.QVBoxLayout(content)
-        layout.setContentsMargins(0, 0, 0, 0)
+        content.setObjectName("panelContent")
+        column = W.QVBoxLayout(content)
+        column.setContentsMargins(2, 0, 2, 2)
         self.output_panel = OutputPanel(self.start_output, self.stop_output)
-        self.output_panel.setFixedWidth(560)
+        self.output_panel.setMinimumWidth(360)
         self.output_panel.set_expanded(True)
-        layout.addWidget(self.output_panel, 0, QtCore.Qt.AlignmentFlag.AlignHCenter)
-        layout.addStretch()
+        column.addWidget(self.output_panel)
+        column.addStretch()
         scroll.setWidget(content)
-        return scroll
+        layout.addWidget(scroll, 1)
+        self.output_panel.settings_changed.connect(self._refresh_output_monitor)
+        self._refresh_output_monitor()
+        return page
+
+    def _refresh_output_monitor(self):
+        remote = isinstance(self.engine, RemoteEngine)
+        state = self.engine.output if remote else {}
+        unknown = bool(remote and self.engine.connection_error)
+        running = state.get("running", False)
+        if unknown:
+            self.output_curve.clear()
+            self.output_monitor_status.setText("核心连接中断 · 输出状态未知")
+            self.output_monitor_info.clear()
+            return
+        try:
+            settings = state["settings"] if running else self.output_panel.settings()
+            times, volts = preview_waveform(settings)
+        except ValueError as exc:
+            self.output_curve.clear()
+            self.output_monitor_status.setText(f"参数无效 · {exc}")
+            self.output_monitor_info.clear()
+            return
+        self.output_curve.setData(times, volts)
+        self.output_plot.setXRange(0, float(times[-1]), padding=0)
+        peak = settings["amplitude_v"] if settings["waveform"] != "dc" else 0
+        half_span = max(peak * 1.2, .1)
+        self.output_plot.setYRange(settings["offset_v"] - half_span,
+                                  settings["offset_v"] + half_span, padding=0)
+        self.output_monitor_status.setText("正在输出 · 当前设定波形" if running else "未输出 · 设定预览")
+        rate = state["actual_rate"] if running else settings["sample_rate"]
+        if settings["waveform"] == "dc":
+            text = f"直流电平 {settings['offset_v']:g} V"
+        else:
+            text = (f"{settings['frequency_hz']:g} Hz · 峰峰值 {2 * peak:g} V · "
+                    f"偏置 {settings['offset_v']:g} V\n"
+                    f"显示 3 个周期 · 每周期约 {rate / settings['frequency_hz']:g} 个更新点")
+        self.output_monitor_info.setText(text)
 
     def _acquisition_section(self):
         section = CollapsibleSection("采集参数", "settings", expanded=True)

@@ -105,29 +105,15 @@ impl Settings {
         } else {
             self.amplitude_v
         };
-        if self.offset_v.abs() + peak > 3.0 {
+        if self.amplitude_v > 3.0 || self.offset_v.abs() + peak > 3.0 {
             return Err("AO 偏置绝对值 + 峰值幅度不能超过 3 V；直流电平由偏置设置".into());
         }
         let rate = dt::plan_output_clock(self.sample_rate)?.actual_rate;
-        if self.waveform != "dc"
-            && !self.waveform.ends_with("noise")
-            && (self.frequency_hz <= 0.0 || self.frequency_hz >= rate / 2.0)
-        {
-            return Err("AO 频率必须大于 0 且小于实际更新率的一半".into());
-        }
-        if self.waveform.starts_with("sweep_")
-            && (self.end_frequency_hz <= 0.
-                || self.end_frequency_hz >= rate / 2.
-                || self.sweep_seconds <= 0.)
-        {
-            return Err("扫频终频必须位于有效频带，扫频时间必须为正".into());
-        }
+        self.validate_frequency(rate)?;
         if self.burst_on_seconds < 0.
             || self.burst_off_seconds < 0.
             || self.fade_in_seconds < 0.
             || self.fade_out_seconds < 0.
-            || self.bandwidth_hz < 0.
-            || self.bandwidth_hz >= rate / 2.
             || self
                 .duration_seconds
                 .is_some_and(|x| !x.is_finite() || x <= 0.)
@@ -155,6 +141,29 @@ impl Settings {
                 .is_some_and(|t| !t.is_finite() || t * rate >= u64::MAX as f64 / 2.)
         {
             return Err("AO 序列时长超出可表示的采样帧数".into());
+        }
+        Ok(())
+    }
+
+    pub fn validate_frequency(&self, rate: f64) -> Result<(), String> {
+        if !rate.is_finite() || rate <= 0. {
+            return Err("AO 实际更新率无效".into());
+        }
+        if self.waveform != "dc"
+            && !self.waveform.ends_with("noise")
+            && (self.frequency_hz <= 0. || self.frequency_hz >= rate / 2.)
+        {
+            return Err(format!("AO 频率必须大于 0 且小于 {} Hz（实际更新率的一半）", rate / 2.));
+        }
+        if self.waveform.starts_with("sweep_")
+            && (self.end_frequency_hz <= 0.
+                || self.end_frequency_hz >= rate / 2.
+                || self.sweep_seconds <= 0.)
+        {
+            return Err("扫频终频必须位于有效频带，扫频时间必须为正".into());
+        }
+        if self.bandwidth_hz < 0. || self.bandwidth_hz >= rate / 2. {
+            return Err("AO 噪声带宽必须非负且小于实际更新率的一半".into());
         }
         Ok(())
     }
@@ -687,6 +696,38 @@ mod tests {
         assert!(s.validate().is_err());
         s.frequency_hz = f64::NAN;
         assert!(s.validate().is_err());
+        s = settings("dc");
+        s.amplitude_v = 3.0001;
+        assert!(s.validate().is_err());
+        s.amplitude_v = 3.;
+        s.offset_v = -3.;
+        assert!(s.validate().is_ok());
+        s.offset_v = -3.0001;
+        assert!(s.validate().is_err());
+    }
+    #[test]
+    fn output_presets_and_actual_clock_boundaries() {
+        for rate in [10000., 20000., 48000., 96000.] {
+            let mut s = settings("sine");
+            s.sample_rate = rate;
+            s.frequency_hz = rate / 2. - 0.001;
+            assert!(s.validate().is_ok());
+            assert!(s.validate_frequency(rate).is_ok());
+            assert!(s.validate_frequency(rate - 1.).is_err());
+            s.frequency_hz = rate / 2.;
+            assert!(s.validate_frequency(rate).is_err());
+        }
+        let mut s = settings("sine");
+        s.amplitude_v = 1.;
+        for offset in [-2., 2.] {
+            s.offset_v = offset;
+            assert!(s.validate().is_ok());
+            for i in 0..480 {
+                assert!(s.volts(i, 48000.).abs() <= 3.);
+            }
+            s.offset_v = offset * 1.0001;
+            assert!(s.validate().is_err());
+        }
     }
     #[test]
     fn frames_preserve_phase_and_dac_scale() {

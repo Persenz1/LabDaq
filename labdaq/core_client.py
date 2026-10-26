@@ -18,12 +18,12 @@ import time
 import numpy as np
 
 from .protocol import AcquisitionConfig, plan_clock
+from .paths import ROOT, FROZEN, RUNTIME_DIR
 
-ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_ENDPOINT = ROOT / ".runtime" / "core.json"
+DEFAULT_ENDPOINT = RUNTIME_DIR / "core.json"
 _CORE_NAME = "labdaq-core.exe" if os.name == "nt" else "labdaq-core"
-CORE_EXE = ROOT / "target" / "release" / _CORE_NAME
-if not CORE_EXE.is_file():
+CORE_EXE = ROOT / _CORE_NAME if FROZEN else ROOT / "target" / "release" / _CORE_NAME
+if not FROZEN and not CORE_EXE.is_file():
     CORE_EXE = ROOT / "core" / "target" / "release" / _CORE_NAME
 
 

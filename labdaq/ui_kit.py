@@ -10,6 +10,11 @@ from PySide6 import QtCore, QtGui, QtWidgets as W
 
 from . import theme
 
+
+class NoWheelComboBox(W.QComboBox):
+    def wheelEvent(self, event):
+        event.ignore()
+
 __all__ = [
     "label", "card", "icon_button", "chip_button", "section_title", "field_label",
     "field", "divider", "status_dot", "status_chip", "Sparkline", "MetricCard",

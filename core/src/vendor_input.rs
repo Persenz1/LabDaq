@@ -709,6 +709,9 @@ impl VendorInput {
             unsafe { (api.olDaGetClockFrequency)(h, &mut rate) },
             "读取实际 AO 更新率",
         )?;
+        settings
+            .validate_frequency(rate)
+            .map_err(|e| Fault::new("configuration_error", e))?;
         check(
             unsafe { (api.olDaGetResolution)(h, &mut bits) },
             "读取 DAC 位数",
@@ -888,6 +891,9 @@ impl VendorInput {
         if !self.output_status.running {
             return Err(Fault::new("configuration_error", "AO 尚未运行"));
         }
+        settings
+            .validate_frequency(self.output_status.actual_rate)
+            .map_err(|e| Fault::new("configuration_error", e))?;
         if self
             .output_status
             .settings

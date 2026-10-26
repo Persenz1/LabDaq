@@ -41,6 +41,11 @@ def test_workbench_pages_and_command_bar_build_at_minimum_size(tmp_path):
         app.processEvents()
         assert window.output_panel.start_button.isVisible()
         assert window.output_panel.stop_button.isVisible()
+        left = window.output_monitor.mapTo(window, QtCore.QPoint())
+        right = window.output_panel.mapTo(window, QtCore.QPoint())
+        assert left.x() + window.output_monitor.width() < right.x()
+        assert window.output_plot.isVisible() and window.output_plot.height() >= 300
+        assert .85 < window.output_monitor.width() / window.output_panel.width() < 1.2
 
         window.nav.setCurrentRow(0)
         app.processEvents()
