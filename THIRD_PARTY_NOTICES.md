@@ -26,3 +26,10 @@ SOFTWARE.
 
 
 Python runtime dependencies are installed separately: PySide6 (LGPL/GPL/commercial options), pyqtgraph (MIT), NumPy and SciPy (BSD), PyUSB (BSD), libusb (LGPL). The Rust core uses rusb (MIT) and its vendored libusb build (LGPL-2.1-or-later). Their source distributions retain their respective licenses; a binary distribution must also meet those dependency license requirements.
+
+---
+
+## 导航与相关文档
+
+- [返回项目主页 (README.md)](README.md)
+- [全局文档导航中心 (docs/README.md)](docs/README.md)

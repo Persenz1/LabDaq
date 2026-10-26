@@ -5,7 +5,10 @@ a = Analysis(
     [str(root / "tools" / "release_entry.py")],
     pathex=[str(root)],
     binaries=[(str(root / "target" / "release" / "labdaq-core.exe"), ".")],
-    datas=[(str(root / "docs" / "用户手册"), "docs/用户手册")],
+    datas=[
+        (str(root / "docs" / "用户手册"), "docs/用户手册"),
+        (str(root / "docs" / "开发文档" / "technical-notes.md"), "docs/开发文档"),
+    ],
     excludes=["torch", "tensorflow", "jax", "cupy", "numba", "matplotlib",
               "pandas", "IPython", "notebook", "pytest", "tkinter"],
 )
