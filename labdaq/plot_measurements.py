@@ -9,6 +9,7 @@ import pyqtgraph as pg
 from PySide6 import QtCore, QtWidgets as W
 
 from . import theme
+from .measurement_cursor import MeasurementCursor
 
 
 class PlotMeasurements(W.QWidget):
@@ -28,13 +29,15 @@ class PlotMeasurements(W.QWidget):
         self.channel_combo = W.QComboBox()
         self.channel_combo.setMinimumContentsLength(12)
         self.channel_combo.setEnabled(False)
-        self.readout = W.QLabel()
-        self.readout.setObjectName("notice")
-        self.readout.setProperty("tone", "info")
+        self.reset_button = W.QPushButton("游标回到窗口")
+        self.reset_button.setEnabled(False)
+        self.reset_button.clicked.connect(self._reset_to_view)
+        self.readout = W.QLabel("左右移动游标，上下调整 A / B 标签。")
+        self.readout.setStyleSheet(f"color: {p.text_muted}; font-size: 11px;")
         self.readout.setTextFormat(QtCore.Qt.TextFormat.PlainText)
         self.readout.setWordWrap(True)
-        self.readout.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.readout.setToolTip("A、B 的时间与幅值取最近真实样本；间隔倒数仅为 1/|Δt|，不代表信号基频。")
+        self.readout.setToolTip("左右拖动标线或字母移动游标；上下拖动字母调整标签位置。"
+                                "也可输入相对时间，读数取最近真实采样点。")
         self.readout.hide()
         layout = W.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -44,7 +47,101 @@ class PlotMeasurements(W.QWidget):
         controls.addWidget(self.enabled_checkbox)
         controls.addWidget(self.channel_combo)
         controls.addStretch()
+        controls.addWidget(self.reset_button)
         layout.addLayout(controls)
+        self.readings_panel = W.QWidget()
+        self.readings_panel.setObjectName("transparentHost")
+        grid = W.QGridLayout(self.readings_panel)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(8)
+        self.time_inputs = []
+        self.value_labels = {}
+        self.unit_labels = {}
+        for index, (name, color) in enumerate(zip(("A", "B"), p.channels[2:4])):
+            frame = W.QFrame()
+            frame.setObjectName("cursorReading")
+            frame.setStyleSheet(
+                f"QFrame#cursorReading {{ background: {theme.blend(p.surface, color, .06)}; "
+                f"border: 1px solid {theme.blend(p.surface, color, .28)}; border-radius: 8px; }}")
+            row = W.QHBoxLayout(frame)
+            row.setContentsMargins(10, 8, 10, 8)
+            row.setSpacing(10)
+            badge = W.QLabel(name)
+            badge.setStyleSheet(f"color: {color}; font-size: 22px; font-weight: 700;")
+            row.addWidget(badge)
+            timing = W.QVBoxLayout()
+            timing.setSpacing(3)
+            title = W.QLabel("相对时间")
+            title.setStyleSheet(f"color: {p.text_muted}; font-size: 11px;")
+            timing.addWidget(title)
+            spin = W.QDoubleSpinBox()
+            spin.setDecimals(9)
+            spin.setRange(0, 0)
+            spin.setSpecialValueText("—")
+            spin.setSuffix(" s")
+            spin.setKeyboardTracking(False)
+            spin.setStyleSheet("QDoubleSpinBox { padding: 3px 20px 3px 6px; min-height: 22px; font-size: 12px; }")
+            spin.setToolTip("输入相对记录起点的时间；自动定位到最近真实采样点。")
+            spin.valueChanged.connect(lambda value, cursor=index: self._time_edited(cursor, value))
+            timing.addWidget(spin)
+            self.time_inputs.append(spin)
+            row.addLayout(timing, 1)
+            amplitude = W.QVBoxLayout()
+            amplitude.setSpacing(3)
+            title = W.QLabel("幅值")
+            title.setStyleSheet(f"color: {p.text_muted}; font-size: 11px;")
+            amplitude.addWidget(title)
+            values = W.QHBoxLayout()
+            values.setSpacing(5)
+            value = W.QLabel("—")
+            value.setMinimumWidth(0)
+            value.setStyleSheet(f"color: {p.text}; font-size: 17px; font-weight: 600;")
+            value.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+            unit = W.QLabel()
+            unit.setStyleSheet(f"color: {p.text_muted}; font-size: 11px;")
+            values.addWidget(value)
+            values.addWidget(unit)
+            values.addStretch()
+            amplitude.addLayout(values)
+            row.addLayout(amplitude, 1)
+            self.value_labels[name] = value
+            self.unit_labels[name] = unit
+            grid.addWidget(frame, 0, index * 2, 1, 2)
+        for column, (key, title, tip) in enumerate((
+            ("delta_t", "时间差 Δt", "B − A，按真实采样时间计算。"),
+            ("delta_y", "幅值差 Δy", "B − A，保留正负方向。"),
+            ("peak_to_peak", "区间峰峰值", "A、B 之间真实样本的最大值 − 最小值。"),
+            ("reciprocal_hz", "间隔倒数 1/|Δt|", "仅为游标时间间隔的倒数，不代表信号基频。"),
+        )):
+            frame = W.QFrame()
+            frame.setObjectName("intervalReading")
+            frame.setStyleSheet(
+                f"QFrame#intervalReading {{ background: {p.surface_alt}; border: 1px solid {p.border}; border-radius: 8px; }}")
+            frame.setToolTip(tip)
+            column_layout = W.QVBoxLayout(frame)
+            column_layout.setContentsMargins(10, 7, 10, 7)
+            column_layout.setSpacing(4)
+            heading = W.QLabel(title)
+            heading.setStyleSheet(f"color: {p.text_muted}; font-size: 11px;")
+            column_layout.addWidget(heading)
+            row = W.QHBoxLayout()
+            row.setSpacing(5)
+            value = W.QLabel("—")
+            value.setMinimumWidth(0)
+            value.setStyleSheet(f"color: {p.text}; font-size: 17px; font-weight: 600;")
+            value.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+            unit = W.QLabel()
+            unit.setStyleSheet(f"color: {p.text_muted}; font-size: 11px;")
+            row.addWidget(value)
+            row.addWidget(unit)
+            row.addStretch()
+            column_layout.addLayout(row)
+            self.value_labels[key] = value
+            self.unit_labels[key] = unit
+            grid.addWidget(frame, 1, column)
+            grid.setColumnStretch(column, 1)
+        self.readings_panel.hide()
+        layout.addWidget(self.readings_panel)
         layout.addWidget(self.readout)
         self.cursor_lines = self._make_cursor_lines(p)
         for index, line in enumerate(self.cursor_lines):
@@ -72,10 +169,7 @@ class PlotMeasurements(W.QWidget):
     def _make_cursor_lines(p):
         cursor_colors = (p.channels[2 % len(p.channels)], p.channels[3 % len(p.channels)])
         return tuple(
-            pg.InfiniteLine(angle=90, movable=True, label=name,
-                            pen=pg.mkPen(color, width=1.5),
-                            hoverPen=pg.mkPen(color, width=2.5),
-                            labelOpts={"position": .96, "color": color})
+            MeasurementCursor(name, color)
             for name, color in zip(("A", "B"), cursor_colors)
         )
 
@@ -176,8 +270,19 @@ class PlotMeasurements(W.QWidget):
     def _position_cursors(self):
         self.channel_combo.setEnabled(self.enabled_checkbox.isChecked() and bool(self._channels))
         if len(self._times):
+            steps = np.diff(self._times)
+            steps = steps[steps > 0]
+            for spin in self.time_inputs:
+                with QtCore.QSignalBlocker(spin):
+                    spin.setSpecialValueText("")
+                    spin.setRange(float(np.min(self._times)), float(np.max(self._times)))
+                    spin.setSingleStep(float(np.min(steps)) if len(steps) else .001)
             low, high = float(np.min(self._x_values)), float(np.max(self._x_values))
             positions = [line.value() for line in self.cursor_lines]
+            for lines in self._cursor_pairs():
+                for line in lines:
+                    with QtCore.QSignalBlocker(line):
+                        line.setBounds((low, high))
             if not self._positioned or all(position < low for position in positions) or all(position > high for position in positions):
                 self._reset_positions(low, high)
 
@@ -188,8 +293,9 @@ class PlotMeasurements(W.QWidget):
             line.setZValue(30)
             plot.addItem(line, ignoreBounds=True)
             with QtCore.QSignalBlocker(line):
+                line.setBounds(self.cursor_lines[index].bounds())
                 line.setValue(self.cursor_lines[index].value())
-            line.setVisible(self.enabled_checkbox.isChecked())
+            line.setVisible(self.enabled_checkbox.isChecked() and bool(len(self._times)))
             self._connect_cursor(line, index)
         self._linked_cursor_lines.append(lines)
         self.linked_lines.extend(lines)
@@ -235,14 +341,53 @@ class PlotMeasurements(W.QWidget):
             for line in lines:
                 line.setVisible(enabled)
         self.readout.setVisible(enabled)
+        self.readings_panel.setVisible(enabled)
         self.channel_combo.setEnabled(enabled and bool(self._channels))
         self._update_measurements()
 
+    def _time_edited(self, cursor, seconds):
+        if not len(self._times):
+            return
+        sample = int(np.argmin(np.abs(self._times - seconds)))
+        self.cursor_lines[cursor].setValue(float(self._x_values[sample]))
+        self._update_measurements()
+
+    def _reset_to_view(self):
+        if not len(self._x_values):
+            return
+        left, right = self.plot.viewRange()[0]
+        low = max(left, float(np.min(self._x_values)))
+        high = min(right, float(np.max(self._x_values)))
+        if low <= high:
+            self._reset_positions(low, high)
+            self._update_measurements()
+
+    def _set_reading(self, key, value, unit, *, empty="无有效数据"):
+        valid = value is not None and math.isfinite(value)
+        self.value_labels[key].setText(f"{value:.9g}" if valid else "—")
+        self.unit_labels[key].setText(unit)
+        self.value_labels[key].setToolTip(f"{value:.12g} {unit}".rstrip() if valid else empty)
+
     def _update_measurements(self, *_):
         channel = self.channel_combo.currentIndex()
-        if not self.enabled_checkbox.isChecked() or not len(self._times) or channel < 0:
+        ready = self.enabled_checkbox.isChecked() and bool(len(self._times)) and channel >= 0
+        self.reset_button.setEnabled(ready)
+        for lines in self._cursor_pairs():
+            for line in lines:
+                line.setVisible(ready)
+        for spin in self.time_inputs:
+            spin.setEnabled(ready)
+        if not ready:
             self.measurements = {}
             self.readout.setText("当前窗口无有效样本。")
+            if not len(self._times) or channel < 0:
+                for spin in self.time_inputs:
+                    with QtCore.QSignalBlocker(spin):
+                        spin.setSpecialValueText("—")
+                        spin.setRange(0, 0)
+                        spin.setValue(0)
+            for key in self.value_labels:
+                self._set_reading(key, None, "")
             return
         indices = [int(np.argmin(np.abs(self._x_values - line.value()))) for line in self.cursor_lines]
         value_channel = 0 if self._series_mode else channel
@@ -265,14 +410,14 @@ class PlotMeasurements(W.QWidget):
             self.measurements["key"] = self._series[channel]["key"]
         unit = self._channels[channel][1]
 
-        def value_text(value, suffix):
-            return f"{value:.9g} {suffix}".rstrip() if value is not None and math.isfinite(value) else "无有效数据"
-
-        reciprocal = value_text(reciprocal_hz, "Hz") if delta_t else "—（同一采样时刻）"
-        self.readout.setText(
-            f"A：t = {t1:.9g} s，y = {value_text(y1, unit)}；"
-            f"B：t = {t2:.9g} s，y = {value_text(y2, unit)}\n"
-            f"Δt = {delta_t:.9g} s；Δy = {value_text(delta_y, unit)}；"
-            f"区间峰峰值 = {value_text(peak_to_peak, unit)}；"
-            f"间隔倒数 1/|Δt| = {reciprocal}"
-        )
+        for spin, timestamp in zip(self.time_inputs, (t1, t2)):
+            with QtCore.QSignalBlocker(spin):
+                spin.setValue(timestamp)
+        self._set_reading("A", y1, unit)
+        self._set_reading("B", y2, unit)
+        self._set_reading("delta_t", delta_t, "s")
+        self._set_reading("delta_y", delta_y, unit)
+        self._set_reading("peak_to_peak", peak_to_peak, unit)
+        self._set_reading("reciprocal_hz", reciprocal_hz, "Hz", empty="同一采样时刻，间隔倒数未定义")
+        self.readout.setText("左右移动游标，上下调整 A / B 标签。" if delta_t
+                             else "A、B 位于同一采样时刻，间隔倒数未定义。")

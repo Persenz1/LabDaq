@@ -34,34 +34,26 @@ def test_replay_time_axes_cursors_and_pause_gaps(tmp_path):
         window.open_replay(path)
         reader = window.replay
         assert reader.duration == .2 and reader.elapsed_duration == .4
-        assert window.selection_stop.maximum() == .4
         assert np.isnan(window.replay_curves[0].yData).sum() == 1
         window.replay_measurements.enabled_checkbox.setChecked(True)
         for line, value in zip(window.replay_measurements.cursor_lines, (.05, .35)):
             line.setValue(value)
         assert window.replay_measurements.measurements["delta_t"] == pytest.approx(.3)
-        window.selection_start.setValue(.09)
-        window.selection_stop.setValue(.31)
-        window.replay_select.setChecked(True)
-        assert window._replay_selection() == (90, 110, [3])
+        assert window._replay_selection() == (0, 200, [3])
         window.replay_time_axis.setCurrentIndex(window.replay_time_axis.findData("absolute"))
         epoch = datetime.fromisoformat(config["acquisition_started_at_utc"]).timestamp() + .2
         assert window._replay_epoch() == epoch
         assert isinstance(window.replay_plot.getAxis("bottom"), pg.DateAxisItem)
         assert window.replay_curves[0].xData[0] == pytest.approx(epoch, abs=1e-6)
-        assert window.replay_region.getRegion() == pytest.approx((epoch + .09, epoch + .31), abs=1e-6)
         assert window.replay_measurements.measurements["delta_t"] == pytest.approx(.3)
-        window.replay_region.setRegion((epoch + .30, epoch + .32))
-        window._replay_region_changed()
-        assert window._replay_selection() == (100, 120, [3])
         window.replay_time_axis.setCurrentIndex(window.replay_time_axis.findData("samples"))
         assert not isinstance(window.replay_plot.getAxis("bottom"), pg.DateAxisItem)
-        assert window.replay_region.getRegion() == pytest.approx((300, 320))
+        assert window.replay_measurements.measurements["delta_t"] == pytest.approx(.3)
+        assert [line.value() for line in window.replay_measurements.cursor_lines] == pytest.approx((50, 350))
         window.replay_time_axis.setCurrentIndex(0)
         window.replay_seconds.setValue(.05)
-        window.replay_start.setValue(.15)
+        window.replay_plot.setXRange(.15, .20, padding=0)
         assert len(window._replay_window()[0]) == 0
-        window.replay_start.setValue(0)
         window.replay_seconds.setValue(1)
         window.analyze_replay()
         window.refresh_analysis()

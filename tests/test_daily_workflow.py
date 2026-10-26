@@ -144,7 +144,7 @@ def dispose(app, *widgets):
     app.processEvents()
 
 
-def test_replay_exact_location_selection_statistics_export_and_png(tmp_path):
+def test_replay_pan_channel_statistics_export_and_png(tmp_path):
     app = W.QApplication.instance() or W.QApplication([])
     configure_application(app)
     fs = 1000.125
@@ -158,33 +158,21 @@ def test_replay_exact_location_selection_statistics_export_and_png(tmp_path):
         recorder.write(raw)
     before = (path / "raw.f64").read_bytes()
     window = MainWindow(core_endpoint=tmp_path / "unused.json")
-    stats = export = library = None
+    stats = export = None
     try:
         window.recording_root = tmp_path
-        library = RecordingLibraryDialog(tmp_path)
-        library.search.setText("记录库筛选")
-        library.table.selectRow(0)
-        library.open_button.click()
-        assert library.selected_path == path
-        window.open_replay(library.selected_path)
+        window.open_replay(path)
         window.replay_seconds.setValue(.1)
-        window.replay_start.setValue(12.345)
+        window.replay_plot.setXRange(12.345, 12.445, padding=0)
         block, start, reader = window._replay_window()
         assert start == int(12.345 * fs + .5)
         np.testing.assert_array_equal(block, raw[start:start + len(block)])
-        window.step_replay(1)
-        assert window._replay_window()[1] == start + len(block)
-        window.step_replay(-1)
-        window.select_replay_window()
+        np.testing.assert_allclose(window.replay_curves[0].yData,
+                                   convert_volts(block, channels)[:, 0])
         window.replay_channel_checks[0].setChecked(False)
         first, stop, selected = window._replay_selection()
-        assert (first, stop, selected) == (start, start + len(block), [3])
+        assert (first, stop, selected) == (0, len(raw), [3])
         assert window.replay_curves[0].xData is None or len(window.replay_curves[0].xData) == 0
-        # Dragging region boundaries updates the same interval used by both tools.
-        window.replay_region.setRegion(((start + 3) / fs, (start + 17) / fs))
-        window._replay_region_changed()
-        first, stop, selected = window._replay_selection()
-        assert (first, stop) == (start + 3, start + 17)
         stats = StatisticsDialog(reader, first, stop, selected)
         spin(app, lambda: stats.job is None)
         assert stats.table.rowCount() == 1 and stats.copy_button.isEnabled()
@@ -217,11 +205,11 @@ def test_replay_exact_location_selection_statistics_export_and_png(tmp_path):
         with pytest.raises(ValueError, match=".png"):
             window.save_plot_image_to(window.replay_plot, path / "raw.f64")
         assert (path / "raw.f64").read_bytes() == before
-        window.selection_start.setValue(window.selection_stop.value())
-        with pytest.raises(ValueError, match="至少需要一个样本"):
+        window.replay_channel_checks[3].setChecked(False)
+        with pytest.raises(ValueError, match="至少勾选一个通道"):
             window._replay_selection()
     finally:
-        dispose(app, *[w for w in (stats, export, library, window) if w is not None])
+        dispose(app, *[w for w in (stats, export, window) if w is not None])
 
 
 def test_rust_simulated_preview_zero_can_be_undone_and_recorded(tmp_path):

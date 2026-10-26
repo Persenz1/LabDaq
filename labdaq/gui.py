@@ -39,7 +39,7 @@ PAGE_SUBTITLES = [
     "连接设备，配置采集参数，实时查看多通道信号波形与数值。",
     "设置 AO 波形与输出参数，控制信号输出和停止归零。",
     "从时间波形到频域，明确每一次分析的来源与单位。",
-    "保留原始信号，让数据可以重新查看、分析和导出。",
+    "打开记录文件夹，查看波形、读取游标并导出原始记录。",
     "查看设备描述符、协议命令和离线冷启动流程。",
 ]
 
@@ -277,6 +277,9 @@ class MainWindow(W.QMainWindow):
         self.replay = None
         self.replay_path: Path | None = None
         self.replay_is_hpf = False
+        self._replay_view_start = 0.0
+        self._replay_view_span = 10.0
+        self._drawing_replay = False
         self._error_shown = ""
         self._tick = 0
         self._build()
@@ -952,20 +955,18 @@ class MainWindow(W.QMainWindow):
         header.setSpacing(8)
         header.addWidget(section_title("记录回看", "history"))
         header.addStretch()
-        header.addWidget(chip_button("记录库", "library", self.open_recording_library))
         header.addWidget(chip_button("打开记录文件夹", "folder", self.choose_replay))
         header.addWidget(chip_button("打开 HPF", "open", self.choose_hpf))
-        header.addWidget(chip_button("最近记录", "history", self.open_last_recording))
         fl.addLayout(header)
         self.replay_info = label("支持原始记录、同步电压 HPF 和已验证的 DT9837C 力记录；按 HPF 原配置换算。",
                                  "notice", True)
         fl.addWidget(self.replay_info)
         options_row = W.QHBoxLayout()
         options_row.setSpacing(10)
-        options_row.addWidget(field_label("显示与取数通道"))
+        options_row.addWidget(field_label("显示与导出通道"))
         self.replay_channel_checks = []
         for i in range(4):
-            check = W.QCheckBox(f"AI {i}")
+            check = W.QCheckBox(f"AI{i}")
             check.setEnabled(False)
             check.toggled.connect(self.draw_replay)
             self.replay_channel_checks.append(check)
@@ -983,7 +984,7 @@ class MainWindow(W.QMainWindow):
         self.replay_seconds.setDecimals(3)
         self.replay_seconds.setValue(10)
         self.replay_seconds.setSuffix(" s")
-        self.replay_seconds.valueChanged.connect(self.draw_replay)
+        self.replay_seconds.valueChanged.connect(self._fit_replay_plot)
         options_row.addWidget(self.replay_seconds)
         fl.addLayout(options_row)
         layout.addWidget(file_card)
@@ -992,69 +993,61 @@ class MainWindow(W.QMainWindow):
         plot_header.setSpacing(8)
         plot_header.addWidget(section_title("回看波形", "wave"))
         plot_header.addStretch()
-        self.statistics_button = chip_button("统计所选数据", "stats", self.show_replay_statistics)
-        plot_header.addWidget(chip_button("导出数据", "export", self.export_replay))
-        plot_header.addWidget(self.statistics_button)
+        export_button = chip_button("导出数据", "export", self.export_replay)
+        export_button.setToolTip("导出勾选通道的完整记录")
+        plot_header.addWidget(export_button)
         plot_header.addWidget(chip_button("保存图像", "save",
                                           lambda: self.save_plot_image(self.replay_plot)))
-        plot_header.addWidget(chip_button("分析此窗口", "wave", self.analyze_replay))
+        self.replay_fit_button = chip_button("适应窗口", "fit", self._fit_replay_plot)
+        plot_header.addWidget(self.replay_fit_button)
         pl.addLayout(plot_header)
         self.replay_plot = plot_widget()
+        self.replay_plot.setToolTip("滚轮缩放；拖动空白处浏览波形；适应窗口恢复显示时长与幅值范围。")
+        self.replay_plot.getViewBox().sigXRangeChanged.connect(self._replay_view_changed)
         replay_legend = self.replay_plot.addLegend(offset=(10, 8), **theme.legend_style(self.p))
         replay_legend.setLabelTextColor(self.p.text_muted)
         replay_legend.hide()
         self.replay_curves = [self.replay_plot.plot(pen=pg.mkPen(c, width=1), name=f"AI {i}",
                                                     autoDownsample=True, downsampleMethod="peak")
                               for i, c in enumerate(self.p.channels)]
-        self.replay_region = pg.LinearRegionItem(values=(0, 1), brush=theme.alpha(self.p.accent, 0.12),
-                                                 pen=pg.mkPen(self.p.accent, width=1))
-        self.replay_plot.addItem(self.replay_region, ignoreBounds=True)
-        self.replay_region.hide()
-        self.replay_region.sigRegionChangeFinished.connect(self._replay_region_changed)
         pl.addWidget(self.replay_plot, 1)
+        timeline_row = W.QHBoxLayout()
+        timeline_row.setSpacing(10)
+        timeline_row.addWidget(field_label("时间范围"))
+        self.replay_timeline = pg.PlotWidget(background=self.p.surface_alt)
+        self.replay_timeline.setFixedHeight(28)
+        self.replay_timeline.setEnabled(False)
+        self.replay_timeline.setMenuEnabled(False)
+        self.replay_timeline.hideButtons()
+        self.replay_timeline.hideAxis("left")
+        self.replay_timeline.hideAxis("bottom")
+        self.replay_timeline.setMouseEnabled(x=False, y=False)
+        self.replay_timeline.getPlotItem().layout.setContentsMargins(10, 0, 10, 0)
+        self.replay_timeline.setToolTip("拖动蓝色区域浏览时间；拖动两端调整显示范围。时间始终相对记录起点。")
+        self.replay_time_region = pg.LinearRegionItem(
+            values=(0, 1), bounds=(0, 1), swapMode="block",
+            brush=theme.alpha(self.p.accent, .18),
+            hoverBrush=theme.alpha(self.p.accent, .28),
+            pen=pg.mkPen(self.p.accent, width=2),
+            hoverPen=pg.mkPen(self.p.accent, width=3))
+        for line in self.replay_time_region.lines:
+            line.addMarker("<|>", position=.5, size=14)
+            line.setCursor(QtCore.Qt.CursorShape.SizeHorCursor)
+        self.replay_time_region.setCursor(QtCore.Qt.CursorShape.SizeHorCursor)
+        self.replay_time_region.sigRegionChanged.connect(self._replay_timeline_changed)
+        self.replay_timeline.addItem(self.replay_time_region)
+        self.replay_timeline.setRange(xRange=(0, 1), yRange=(0, 1), padding=0)
+        timeline_row.addWidget(self.replay_timeline, 1)
+        self.replay_time_range = label("尚未打开记录", "muted")
+        self.replay_time_range.setFixedWidth(190)
+        self.replay_time_range.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+        timeline_row.addWidget(self.replay_time_range)
+        pl.addLayout(timeline_row)
         self.replay_legend_row = W.QHBoxLayout()
         self.replay_legend_row.setSpacing(16)
         pl.addLayout(self.replay_legend_row)
         self.replay_measurements = PlotMeasurements(self.replay_plot)
         pl.addWidget(self.replay_measurements)
-        transport = W.QHBoxLayout()
-        transport.setSpacing(8)
-        transport.addWidget(chip_button("上一窗口", "chevron_left", lambda: self.step_replay(-1)))
-        transport.addWidget(chip_button("下一窗口", "chevron_right", lambda: self.step_replay(1)))
-        transport.addSpacing(4)
-        transport.addWidget(field_label("起点"))
-        self.replay_start = W.QDoubleSpinBox()
-        self.replay_start.setDecimals(9)
-        self.replay_start.setRange(0, 0)
-        self.replay_start.setSuffix(" s")
-        self.replay_start.valueChanged.connect(self.draw_replay)
-        transport.addWidget(self.replay_start)
-        self.replay_slider = W.QSlider(QtCore.Qt.Orientation.Horizontal)
-        self.replay_slider.setRange(0, 1000)
-        self.replay_slider.valueChanged.connect(self._replay_slider_changed)
-        transport.addWidget(self.replay_slider, 1)
-        self.replay_position = label("0.00 s", "muted")
-        transport.addWidget(self.replay_position)
-        pl.addLayout(transport)
-        selection = W.QHBoxLayout()
-        selection.setSpacing(8)
-        self.replay_select = W.QCheckBox("使用选区")
-        self.replay_select.toggled.connect(self._replay_selection_changed)
-        selection.addWidget(self.replay_select)
-        self.selection_start, self.selection_stop = W.QDoubleSpinBox(), W.QDoubleSpinBox()
-        for spin in (self.selection_start, self.selection_stop):
-            spin.setDecimals(9)
-            spin.setRange(0, 0)
-            spin.setSuffix(" s")
-            spin.setEnabled(False)
-            spin.valueChanged.connect(self._replay_selection_changed)
-        selection.addWidget(self.selection_start)
-        selection.addWidget(label("至", "muted"))
-        selection.addWidget(self.selection_stop)
-        selection.addWidget(chip_button("选当前窗口", "fit", self.select_replay_window))
-        selection.addStretch()
-        selection.addWidget(label("统计与导出使用勾选通道；未启用选区时处理全记录。", "faint"))
-        pl.addLayout(selection)
         layout.addWidget(plot_card, 1)
         return page
 
@@ -1779,7 +1772,7 @@ class MainWindow(W.QMainWindow):
             if self._live_cache is not None:
                 self._draw_live(*self._live_cache)
         elif self.replay is not None:
-            self.draw_replay()
+            self.draw_replay(reset_view=True)
         if cursor_times and available:
             rate = self.engine.sample_rate if source == "live" else self.replay.sample_rate
             for line, timestamp in zip(measurements.cursor_lines, cursor_times):
@@ -2261,6 +2254,8 @@ class MainWindow(W.QMainWindow):
                 if not reader.voltage_compatible:
                     raise ValueError(reader.voltage_replay_error)
             else:
+                if not (path / "metadata.json").is_file():
+                    raise ValueError("所选文件夹中没有记录数据，请选择包含 metadata.json 和 raw.f64 的记录文件夹。")
                 reader = load_session(path)
             if len(reader.channels) > 4:
                 raise ValueError("此原型界面最多显示四路；文件未修改，请使用读取 API 处理全部通道。")
@@ -2273,24 +2268,16 @@ class MainWindow(W.QMainWindow):
                 check.blockSignals(True)
                 check.setEnabled(channel is not None)
                 check.setChecked(channel is not None)
-                text = f"AI {i} · {channel.name}" if channel else f"AI {i}"
-                check.setText(text if len(text) <= 18 else text[:17] + "…")
+                check.setText(f"AI{i}")
                 check.setToolTip(channel.name if channel else "")
                 check.blockSignals(False)
-            duration = getattr(reader, "elapsed_duration", reader.duration)
-            for spin, value in ((self.selection_start, 0), (self.selection_stop, duration)):
-                spin.blockSignals(True)
-                spin.setRange(0, duration)
-                spin.setSingleStep(1 / reader.sample_rate)
-                spin.setValue(value)
-                spin.blockSignals(False)
-            self.replay_select.setChecked(False)
-            self._replay_selection_changed()
-            self.replay_start.blockSignals(True)
-            self.replay_start.setValue(0)
-            self.replay_start.setSingleStep(1 / reader.sample_rate)
-            self.replay_start.blockSignals(False)
+            self._replay_view_start = 0.0
+            self._replay_view_span = self.replay_seconds.value()
+            self.replay_measurements.set_data([], np.empty((0, 0)), [])
+            self.replay_measurements._positioned = False
+            self.tell(f"已打开记录 · {path}", "success")
             self._time_axis_changed("replay")
+            self.replay_measurements.enabled_checkbox.setChecked(True)
             self._analysis_source_changed()
             self.nav.setCurrentRow(3)
         except (OSError, ValueError, KeyError) as exc:
@@ -2298,9 +2285,9 @@ class MainWindow(W.QMainWindow):
 
     def _replay_window(self):
         r = self.replay
-        span = min(self.replay_seconds.value(), 200000 / r.sample_rate)
+        span = min(self._replay_view_span, 200000 / r.sample_rate)
         maximum = max(0, getattr(r, "elapsed_duration", r.duration) - span)
-        time_start = min(self.replay_start.value(), maximum)
+        time_start = min(self._replay_view_start, maximum)
         start = self._replay_boundary(time_start)
         stop = self._replay_boundary(time_start + span)
         raw = r.read(start=start, count=min(200000, stop - start))
@@ -2322,50 +2309,45 @@ class MainWindow(W.QMainWindow):
         return self._time_axis_values(self.replay_plot, np.asarray(times), self.replay_time_axis.currentData(),
                                       self._replay_epoch(), self.replay.sample_rate)
 
-    def _replay_slider_changed(self, position):
-        if self.replay is None:
-            return
-        self.replay_start.setValue(self.replay_start.maximum() * position / 1000)
-
-    def step_replay(self, direction):
+    def _fit_replay_plot(self, *_):
         if self.replay is not None:
-            span = min(self.replay_seconds.value(), 200000 / self.replay.sample_rate)
-            self.replay_start.setValue(self.replay_start.value() + direction * span)
+            self._replay_view_span = self.replay_seconds.value()
+            self.draw_replay(reset_view=True)
 
-    def select_replay_window(self):
-        if self.replay is None:
+    def _replay_view_changed(self, _, limits):
+        if self.replay is None or self._drawing_replay:
             return
-        raw, start, reader = self._replay_window()
-        times = self._replay_times(reader, start, len(raw))
-        self.selection_start.setValue(times[0] if len(times) else self.replay_start.value())
-        self.selection_stop.setValue(times[-1] + 1 / reader.sample_rate if len(times) else
-                                     self.replay_start.value() + self.replay_seconds.value())
-        self.replay_select.setChecked(True)
-
-    def _replay_selection_changed(self, *_):
-        selected = self.replay_select.isChecked()
-        for spin in (self.selection_start, self.selection_stop):
-            spin.setEnabled(selected and self.replay is not None)
-        self.replay_region.setVisible(selected and self.replay is not None)
-        if self.replay is None:
-            return
-        self.replay_region.blockSignals(True)
-        duration = getattr(self.replay, "elapsed_duration", self.replay.duration)
-        self.replay_region.setBounds(tuple(self._replay_x([0, duration])))
-        self.replay_region.setRegion(tuple(self._replay_x([self.selection_start.value(), self.selection_stop.value()])))
-        self.replay_region.blockSignals(False)
-
-    def _replay_region_changed(self):
-        start, stop = self.replay_region.getRegion()
+        low, high = limits
         mode = self.replay_time_axis.currentData()
         if mode == "absolute" and self._replay_epoch() is not None:
-            start, stop = start - self._replay_epoch(), stop - self._replay_epoch()
+            low, high = low - self._replay_epoch(), high - self._replay_epoch()
         elif mode == "samples":
-            start, stop = start / self.replay.sample_rate, stop / self.replay.sample_rate
-        for spin, value in ((self.selection_start, start), (self.selection_stop, stop)):
-            spin.blockSignals(True)
-            spin.setValue(value)
-            spin.blockSignals(False)
+            low, high = low / self.replay.sample_rate, high / self.replay.sample_rate
+        self._replay_view_start = max(0.0, low)
+        self._replay_view_span = high - low
+        self.draw_replay()
+
+    def _replay_timeline_changed(self, *_):
+        if self.replay is None or self._drawing_replay:
+            return
+        low, high = self.replay_time_region.getRegion()
+        span = max(1 / self.replay.sample_rate, min(high - low, 200000 / self.replay.sample_rate))
+        duration = max(getattr(self.replay, "elapsed_duration", self.replay.duration), span)
+        low = min(low, duration - span)
+        left, right = self._replay_x([low, low + span])
+        self.replay_plot.setXRange(left, right, padding=0)
+        self._sync_replay_timeline()
+
+    def _sync_replay_timeline(self):
+        duration = getattr(self.replay, "elapsed_duration", self.replay.duration)
+        extent = max(duration, 1 / self.replay.sample_rate)
+        low, high = self._replay_view_start, self._replay_view_start + self._replay_view_span
+        with QtCore.QSignalBlocker(self.replay_time_region):
+            self.replay_time_region.setBounds((0, extent))
+            self.replay_time_region.setRegion((low, high))
+        self.replay_timeline.setXRange(0, extent, padding=0)
+        self.replay_timeline.setEnabled(self.replay.sample_count > 1)
+        self.replay_time_range.setText(f"{low:.6g}–{high:.6g} s / {duration:.6g} s")
 
     def _replay_selection(self):
         if self.replay is None:
@@ -2374,8 +2356,6 @@ class MainWindow(W.QMainWindow):
         if not channels:
             raise ValueError("请至少勾选一个通道")
         start, stop = 0, self.replay.sample_count
-        if self.replay_select.isChecked():
-            start, stop = [self._replay_boundary(spin.value()) for spin in (self.selection_start, self.selection_stop)]
         if stop <= start:
             raise ValueError("所选区间至少需要一个样本，起点必须小于终点")
         return start, stop, channels
@@ -2388,21 +2368,35 @@ class MainWindow(W.QMainWindow):
         self._clear_layout(self.replay_legend_row)
         for channel in visible:
             self.replay_legend_row.addWidget(
-                legend_chip(f"AI {channel.index} · {channel.name}", self.p.channels[channel.index]))
+                legend_chip(f"AI{channel.index}", self.p.channels[channel.index]))
         self.replay_legend_row.addStretch()
 
-    def draw_replay(self, *_):
-        if self.replay is None:
+    def draw_replay(self, *_, reset_view=False):
+        if self.replay is None or self._drawing_replay:
             return
+        self._drawing_replay = True
+        try:
+            self._draw_replay(reset_view)
+        finally:
+            self._drawing_replay = False
+
+    def _draw_replay(self, reset_view):
+        r = self.replay
+        duration = max(getattr(r, "elapsed_duration", r.duration), 1 / r.sample_rate)
+        self._replay_view_span = min(self._replay_view_span, duration, 200000 / r.sample_rate)
+        self._replay_view_start = min(self._replay_view_start, max(0, duration - self._replay_view_span))
+        view = self.replay_plot.getViewBox()
+        if reset_view:
+            low, high = self._replay_x([0, duration])
+            scale = r.sample_rate if self.replay_time_axis.currentData() == "samples" else 1
+            # Read only the visible interval; dragging the plot loads adjacent data.
+            view.setLimits(xMin=low, xMax=high, minXRange=scale / r.sample_rate,
+                           maxXRange=min(duration, 200000 / r.sample_rate) * scale)
+            left, right = self._replay_x([self._replay_view_start,
+                                         self._replay_view_start + self._replay_view_span])
+            view.setXRange(left, right, padding=0)
+            view.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
         raw, start, r = self._replay_window()
-        span = min(self.replay_seconds.value(), 200000 / r.sample_rate)
-        max_start = max(0, getattr(r, "elapsed_duration", r.duration) - span)
-        self.replay_start.blockSignals(True)
-        self.replay_start.setMaximum(max_start)
-        self.replay_start.blockSignals(False)
-        self.replay_slider.blockSignals(True)
-        self.replay_slider.setValue(round(self.replay_start.value() / max_start * 1000) if max_start else 0)
-        self.replay_slider.blockSignals(False)
         converted = convert_volts(raw, r.channels)
         visible = [c for c in r.channels if self.replay_channel_checks[c.index].isChecked()]
         units = {c.unit for c in visible}
@@ -2418,17 +2412,15 @@ class MainWindow(W.QMainWindow):
             if j < len(r.channels) and self.replay_channel_checks[r.channels[j].index].isChecked():
                 curve.setPen(pg.mkPen(self.p.channels[r.channels[j].index], width=1))
                 curve.setData(plot_x, plot_values[:, j], connect="finite")
-                self.replay_plot.plotItem.legend.addItem(curve, f"AI {r.channels[j].index} · {r.channels[j].name}")
+                self.replay_plot.plotItem.legend.addItem(curve, f"AI{r.channels[j].index}")
             else:
                 curve.setData([], [])
         self._sync_replay_legend(visible)
-        self.replay_plot.enableAutoRange()
         columns = [j for j, c in enumerate(r.channels) if c in visible]
         unit = next(iter(units)) if len(units) == 1 else "V"
         self.replay_measurements.set_data(times, values[:, columns],
-                                          [(f"AI {c.index} · {c.name}", unit) for c in visible], x_values=x)
-        self._replay_selection_changed()
-        self.replay_position.setText(f"{self.replay_start.value():.6f} s")
+                                          [(f"AI{c.index}", unit) for c in visible], x_values=x)
+        self._sync_replay_timeline()
         source = "原厂 HPF 文件" if self.replay_is_hpf else "协议模拟" if r.metadata.get("source") == "simulation" else str(r.metadata.get("source", "未知"))
         ending = (r.metadata.get("waveform_only_note") or "只读 HPF 波形") if self.replay_is_hpf else "异常中止：" + str(r.metadata.get("error")) if r.metadata.get("error") else "正常结束" if r.metadata.get("finalized") else "未正常关闭的记录"
         if r.metadata.get("termination_reason") == "duration_complete":
@@ -2454,7 +2446,7 @@ class MainWindow(W.QMainWindow):
         channel_details = []
         for channel in r.channels:
             annotation = (f"P{channel.point_number} " if channel.point_number is not None else "") + channel.direction
-            channel_details.append(f"AI {channel.index} {channel.name}"
+            channel_details.append(f"AI{channel.index}"
                                    + (f"（{annotation}）" if annotation else ""))
         self.replay_info.setText(f"{self.replay_path.name}  ·  {source}  ·  {len(r.channels)} 路  ·  {r.sample_rate:,.3f} S/s  ·  {r.sample_count:,} 扫描  /  {r.sample_count/r.sample_rate:.2f} s\n{ending}"
                                  + (f"\n{descriptive}" if descriptive else "")

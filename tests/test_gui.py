@@ -57,7 +57,7 @@ def test_chinese_workbench_record_analyze_replay(tmp_path):
         assert window.pages.currentIndex() == 3
         assert window.replay.sample_count == session.sample_count
         names = [text.text for _, text in window.replay_plot.plotItem.legend.items]
-        assert names[-1].startswith("AI 3") and len(names) == 3
+        assert names[-1] == "AI3" and len(names) == 3
         export_csv(window.latest_recording, tmp_path / "export.csv")
         window.load_profile_from(profile)
         assert window.active_channels == (0, 1, 3)
