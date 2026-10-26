@@ -13,7 +13,7 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets as W
 
-from . import theme
+from . import __version__, theme
 from .ui_kit import (CollapsibleSection, METRIC_VALUE_MODES, MetricCard, NoWheelComboBox, card, chip_button, divider,
                      field, field_label, label, legend_chip, section_title,
                      status_chip, status_dot)
@@ -31,7 +31,7 @@ from .data_dialog import ExportDialog, StatisticsDialog
 from .recording_library import RecordingLibraryDialog
 from .plot_measurements import PlotMeasurements
 from .transport import enumerate_usb_devices
-from .paths import ROOT, RECORDING_ROOT
+from .paths import FROZEN, ROOT, RECORDING_ROOT
 
 NAV_TITLES = ["实时采集", "信号输出", "信号分析", "数据回看", "设备与协议"]
 NAV_ICONS = ["wave", "export", "stats", "history", "chip"]
@@ -105,7 +105,7 @@ class ChannelDialog(W.QDialog):
         layout.setContentsMargins(22, 20, 22, 18)
         layout.setSpacing(12)
         layout.addWidget(label("通道与传感器", "pageTitle"))
-        layout.addWidget(label("当前 10 mV/N 为演示灵敏度。实际测量请填写传感器与调理器的换算参数；"
+        layout.addWidget(label("默认直接读取电压 V，无需填写灵敏度。使用其他单位时，请填写传感器与调理器的换算参数；"
                                "原始电压始终保留。", "notice", True))
         table_card, tl = card(margins=(10, 10, 10, 10), spacing=8)
         self.table = W.QTableWidget(4, 12)
@@ -127,7 +127,7 @@ class ChannelDialog(W.QDialog):
             name = W.QLineEdit(settings.name)
             point = W.QSpinBox()
             point.setRange(0, 999999)
-            point.setSpecialValueText("未设置")
+            point.setToolTip("0 表示未设置测点号。")
             point.setValue(settings.point_number or 0)
             direction = W.QComboBox()
             direction.setEditable(True)
@@ -138,9 +138,12 @@ class ChannelDialog(W.QDialog):
             unit.addItems(["N", "V", "Pa", "g", "mm", "°C"])
             unit.setCurrentText(settings.unit)
             sensitivity = W.QDoubleSpinBox()
-            sensitivity.setRange(0.000001, 1e6)
+            sensitivity.setRange(0, 1e6)
             sensitivity.setDecimals(6)
             sensitivity.setValue(settings.sensitivity_mv_per_unit)
+            sensitivity.setEnabled(unit.currentText().strip() != "V")
+            unit.currentTextChanged.connect(
+                lambda text, control=sensitivity: control.setEnabled(text.strip() != "V"))
             engineering_offset = W.QDoubleSpinBox()
             engineering_offset.setRange(-1e12, 1e12)
             engineering_offset.setDecimals(9)
@@ -158,10 +161,10 @@ class ChannelDialog(W.QDialog):
             coupling = W.QComboBox()
             coupling.addItems(["DC", "AC"])
             coupling.setCurrentText(window.coupling[i])
-            coupling.setToolTip("模拟器的 AC 为 1 Hz 一阶高通演示模型；实际硬件频响仍需测量。")
+            coupling.setToolTip("选择 AC 或 DC 输入耦合；设置在开始采集时应用。")
             iepe = W.QCheckBox("2 mA")
             iepe.setChecked(window.iepe[i])
-            iepe.setToolTip("模拟器验证激励设置的寄存器命令，不模拟传感器的供电与电气响应。")
+            iepe.setToolTip("为 IEPE 传感器启用恒流激励；接入普通电压信号时请关闭。")
             row = (enabled, name, point, direction, unit, sensitivity, engineering_offset,
                    zero, inverted, ranges, coupling, iepe)
             self.cells.append(row)
@@ -223,12 +226,17 @@ class ChannelDialog(W.QDialog):
         if not active:
             W.QMessageBox.information(self, "通道设置", "至少启用一个通道。")
             return
+        for i, row in enumerate(self.cells):
+            unit = row[4].currentText().strip() or "V"
+            if unit != "V" and row[5].value() <= 0:
+                W.QMessageBox.information(self, "通道设置", f"通道{i + 1} 使用 {unit}，请填写大于 0 的灵敏度。")
+                return
         w = self.window
         for i, row in enumerate(self.cells):
             (_, name, point, direction, unit, sensitivity, engineering_offset,
              zero, inverted, ranges, coupling, iepe) = row
             w.channels[i] = ChannelSettings(
-                i, name.text().strip() or f"通道 {i}", unit.currentText().strip() or "N",
+                i, name.text().strip() or f"通道{i + 1}", unit.currentText().strip() or "V",
                 sensitivity.value(), zero.value(), inverted.isChecked(),
                 point_number=point.value() or None, direction=direction.currentText().strip(),
                 engineering_offset=engineering_offset.value())
@@ -246,10 +254,11 @@ class MainWindow(W.QMainWindow):
             configure_application(app)
         super().__init__()
         self.p = theme.current()
-        self.setWindowTitle("LabDAQ · 实验采集原型")
+        self.setWindowTitle(f"LabDAQ {__version__} · 实验数据采集")
         self.resize(1450, 940)
         self.setMinimumSize(1180, 780)
-        self.channels = [ChannelSettings(i, n) for i, n in enumerate(["切向力", "法向力", "侧向力", "参考通道"])]
+        self.channels = [ChannelSettings(i, f"通道{i + 1}", unit="V", sensitivity_mv_per_unit=0)
+                         for i in range(4)]
         self.active_channels = (0, 1, 2, 3)
         self.ranges = [10.0] * 4
         self.coupling = ["DC"] * 4
@@ -269,6 +278,7 @@ class MainWindow(W.QMainWindow):
         self._live_display_key = None
         self._preview_invalidated = False
         self._buttons_refresh_key = None
+        self._core_session = None
         self._live_follow = True
         self._connecting = False
         self._device_worker = None
@@ -301,6 +311,10 @@ class MainWindow(W.QMainWindow):
 
     def _restore_core_session(self):
         p = self.engine.profile
+        self._core_session = (p, self.engine.acquisition_started_at_utc, self.engine.last_recording)
+        self._live_cache = None
+        self._live_display_key = None
+        self._preview_invalidated = False
         self.channels = [ChannelSettings(**c) for c in p["channels"]]
         config = self.engine.config
         self.active_channels = tuple(config.channels)
@@ -425,7 +439,7 @@ class MainWindow(W.QMainWindow):
         dl.addWidget(self.reconnect_button)
         sl.addWidget(device)
         sl.addSpacing(10)
-        sl.addWidget(label("内部开发版 v0.1", "sideCaption"))
+        sl.addWidget(label(f"LabDAQ v{__version__}", "sideCaption"))
         return side
 
     def _header(self):
@@ -734,17 +748,18 @@ class MainWindow(W.QMainWindow):
         section.add(self.directory_button)
         self._refresh_recording_directory()
         section.add(divider())
-        # Retain internal sources for tests and --demo; the acquisition panel is hardware-only.
+        # Source builds retain developer inputs; the installed application is hardware-only.
         self.input_controls = W.QWidget(self)
         self.input_controls.hide()
         inputs = W.QVBoxLayout(self.input_controls)
         self.scenario = W.QComboBox()
-        self.scenario.addItem("拖拽载荷 · 周期接触", "drag")
-        self.scenario.addItem("正弦 · 频谱验证", "sine")
-        self.scenario.addItem("阶跃 · 零点与响应", "step")
-        self.scenario.addItem("可配置电信号 · 电压模拟", "custom")
-        self.scenario.addItem("原始 HPF · 按时间回放", "hpf")
-        self.scenario.addItem("独立核心 · 电信号模拟", "rust")
+        if not FROZEN:
+            self.scenario.addItem("拖拽载荷 · 周期接触", "drag")
+            self.scenario.addItem("正弦 · 频谱验证", "sine")
+            self.scenario.addItem("阶跃 · 零点与响应", "step")
+            self.scenario.addItem("可配置电信号 · 电压模拟", "custom")
+            self.scenario.addItem("原始 HPF · 按时间回放", "hpf")
+            self.scenario.addItem("独立核心 · 电信号模拟", "rust")
         self.scenario.addItem("DT9837C · 原厂驱动输入", "usb")
         self.scenario.setCurrentIndex(self.scenario.findData("usb"))
         inputs.addWidget(field("输入来源", self.scenario))
@@ -1352,6 +1367,8 @@ class MainWindow(W.QMainWindow):
         if worker.engine is not None:
             previous = self.engine
             self.engine = worker.engine
+            self._core_session = (self.engine.profile, self.engine.acquisition_started_at_utc,
+                                  self.engine.last_recording)
             self._preview_invalidated = False
             if isinstance(previous, RemoteEngine):
                 previous.detach()
@@ -1406,6 +1423,8 @@ class MainWindow(W.QMainWindow):
                 engine.start(recording_path=recording_path, recording_options=recording_options,
                                   experiment=self.experiment.text())
             self.engine = engine
+            self._core_session = ((engine.profile, engine.acquisition_started_at_utc, engine.last_recording)
+                                  if isinstance(engine, RemoteEngine) else None)
             self._preview_invalidated = False
             if isinstance(previous, RemoteEngine):
                 previous.detach()
@@ -1634,6 +1653,10 @@ class MainWindow(W.QMainWindow):
         self._tick += 1
         if self.engine is None:
             return
+        if isinstance(self.engine, RemoteEngine) and self._core_session is not None:
+            session = (self.engine.profile, self.engine.acquisition_started_at_utc, self.engine.last_recording)
+            if session != self._core_session:
+                self._restore_core_session()
         buttons_key = (
             self.engine, self.engine.running, self.engine.recording,
             self.engine.recording_paused, self.engine.error, self.engine.termination_reason,
@@ -2026,6 +2049,8 @@ class MainWindow(W.QMainWindow):
         config = AcquisitionConfig(sample_rate=data["sample_rate"], channels=tuple(data["active_channels"]),
                                    ranges=tuple(data["ranges"]), coupling=tuple(data["coupling"]), iepe=tuple(data["iepe"]))
         mode = data["scenario"]
+        if FROZEN and mode != "usb":
+            raise ValueError("安装版仅支持 DT9837C 原厂驱动输入，不支持开发用模拟或 HPF 采集输入")
         if self.scenario.findData(mode) < 0:
             raise ValueError("未知输入来源")
         settings = SimulationSettings.from_dict(data["signal_settings"]) if "signal_settings" in data else SimulationSettings()
@@ -2240,7 +2265,7 @@ class MainWindow(W.QMainWindow):
         if self.latest_recording:
             self.open_replay(self.latest_recording)
         else:
-            self.tell("还没有记录。先开始预览并保存一段模拟数据。")
+            self.tell("还没有记录。请先连接设备并保存一段记录。")
 
     def open_replay(self, path: Path):
         if self.engine and self.engine.recording and path == self.latest_recording:
@@ -2258,7 +2283,7 @@ class MainWindow(W.QMainWindow):
                     raise ValueError("所选文件夹中没有记录数据，请选择包含 metadata.json 和 raw.f64 的记录文件夹。")
                 reader = load_session(path)
             if len(reader.channels) > 4:
-                raise ValueError("此原型界面最多显示四路；文件未修改，请使用读取 API 处理全部通道。")
+                raise ValueError("当前界面最多显示四路；文件未修改。")
             self.replay = reader
             self.replay_is_hpf = is_hpf
             self.replay_path = path
@@ -2570,8 +2595,10 @@ class MainWindow(W.QMainWindow):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="LabDAQ 中文桌面原型")
-    parser.add_argument("--demo", action="store_true", help="打开后开始模拟预览")
+    parser = argparse.ArgumentParser(description="LabDAQ 中文数据采集软件")
+    parser.set_defaults(demo=False)
+    if not FROZEN:
+        parser.add_argument("--demo", action="store_true", help="打开后开始模拟预览")
     args = parser.parse_args()
     app = W.QApplication.instance() or W.QApplication(sys.argv[:1])
     configure_application(app)

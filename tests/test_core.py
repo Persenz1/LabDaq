@@ -50,6 +50,117 @@ def profile(settings=None, selected=(0, 1, 2, 3), rate=2000, coupling=("DC",) * 
             "experiment": "核心测试", "recording_root": str(ROOT / "recordings")}
 
 
+@pytest.mark.parametrize("contents", ["{broken", '{"port":47638}'])
+def test_invalid_endpoint_is_replaced_by_new_core(tmp_path, contents):
+    endpoint = tmp_path / "invalid.json"
+    endpoint.write_text(contents, encoding="utf-8")
+    client, state = CoreClient.connect_or_start(endpoint)
+    try:
+        assert client.address["port"] > 0
+        assert not state["running"] and not state["recording"]
+    finally:
+        client.request("shutdown")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows GUI/API startup lock")
+def test_simultaneous_clients_share_one_new_core(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+
+    endpoint = tmp_path / "shared.json"
+    barrier = threading.Barrier(2)
+
+    def start():
+        barrier.wait(timeout=5)
+        return CoreClient.connect_or_start(endpoint)[0]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first, second = list(pool.map(lambda _: start(), range(2)))
+    try:
+        assert first.address == second.address
+    finally:
+        first.request("shutdown")
+
+
+def test_open_gui_tracks_external_acquisition_channel_changes(core, tmp_path):
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6 import QtCore, QtWidgets as W
+    from labdaq.gui import MainWindow, configure_application
+
+    app = W.QApplication.instance() or W.QApplication([])
+    configure_application(app)
+    core.request("start", profile=profile(rate=1000))
+    window = MainWindow(core_endpoint=core.endpoint)
+    try:
+        until(lambda: window.engine.total_scans >= 100)
+        window.refresh()
+        core.request("stop")
+        updated = profile(selected=(0, 2), rate=2000)
+        updated["channels"][2]["name"] = "Agent 通道"
+        updated["experiment"] = "Agent 实验"
+        core.request("start", profile=updated)
+        until(lambda: tuple(window.engine.config.channels) == (0, 2)
+              and window.engine.total_scans >= 100)
+        window.refresh()
+        assert window.active_channels == (0, 2)
+        assert window.channels[2].name == "Agent 通道"
+        assert window.experiment.text() == "Agent 实验"
+        assert window.rate.currentData() == 2000
+        assert not window.engine.connection_error
+        assert window.engine.snapshot()[1].shape[1] == 2
+        path = tmp_path / "agent-record"
+        core.request("start_recording", path=str(path), channels=updated["channels"], experiment="Agent 记录")
+        until(lambda: window.engine.recording)
+        window.refresh()
+        assert window.latest_recording == path
+        assert window.experiment.text() == "Agent 记录"
+        core.request("stop_recording")
+        core.request("stop")
+        same_profile = core.request("poll")["profile"]
+        previous_start = window.engine.acquisition_started_at_utc
+        window._preview_invalidated = True
+        core.request("start", profile=same_profile)
+        until(lambda: window.engine.acquisition_started_at_utc != previous_start)
+        window.refresh()
+        assert not window._preview_invalidated
+        next_path = tmp_path / "agent-record-2"
+        core.request("start_recording", path=str(next_path), channels=same_profile["channels"],
+                     experiment=same_profile["experiment"], recording_options=same_profile["recording_options"])
+        until(lambda: window.engine.last_recording == next_path)
+        window.refresh()
+        assert window.latest_recording == next_path
+        core.request("stop_recording")
+        core.request("stop")
+    finally:
+        window.engine.detach()
+        window.engine = None
+        window.close()
+        window.deleteLater()
+        QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.Type.DeferredDelete)
+        app.processEvents()
+
+
+def test_stale_credentials_do_not_change_another_live_recording(core, tmp_path):
+    path = tmp_path / "active-recording"
+    core.request("start", profile=profile(), recording_path=str(path))
+    until(lambda: core.request("poll")["recorded_scans"] >= 100)
+    before = core.request("poll")
+    endpoint = tmp_path / "stale.json"
+    endpoint.write_text(json.dumps({**core.address, "token": "old-credential"}), encoding="utf-8")
+    alternate, state = CoreClient.connect_or_start(endpoint)
+    try:
+        assert alternate.address["port"] != core.address["port"]
+        assert not state["running"] and not state["recording"]
+        reconnected, current = CoreClient.connect_or_start(core.endpoint)
+        assert reconnected.address == core.address
+        assert current["running"] and current["recording"]
+        assert current["last_recording"] == before["last_recording"]
+        assert current["recorded_scans"] >= before["recorded_scans"]
+        assert current["output"] == before["output"]
+    finally:
+        alternate.request("shutdown")
+
+
 @pytest.mark.parametrize("waveform", ["dc", "sine", "square", "triangle", "sawtooth", "step", "pulse", "chirp"])
 def test_rust_waveforms_and_recording_match_python(core, tmp_path, waveform):
     specs = tuple(SignalSpec(waveform=waveform, amplitude_v=.7 + i * .2, offset_v=.17,

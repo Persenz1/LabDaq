@@ -1,3 +1,3 @@
-"""LabDAQ: independent DT9837C research prototype."""
+"""LabDAQ: DT9837C data acquisition workbench."""
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"

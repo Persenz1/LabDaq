@@ -97,6 +97,26 @@ fn check(code: Ecode, operation: &str) -> Result<(), Fault> {
     }
 }
 
+fn stop_stream_worker(
+    active: &AtomicBool,
+    worker: &mut Option<JoinHandle<()>>,
+    abort: impl FnOnce() -> Ecode,
+) -> Result<(), Fault> {
+    active.store(false, Ordering::Release);
+    if let Some(worker) = worker.take() {
+        worker
+            .join()
+            .map_err(|_| Fault::new("core_error", "原厂数据线程异常退出"))?;
+    }
+    // OLERRORS.H: OLNOTRUNNING (28) means the subsystem has already stopped.
+    // This is only acceptable for Abort; data/buffer errors remain failures.
+    let code = abort();
+    if code != 28 {
+        check(code, "中止缓冲流")?;
+    }
+    Ok(())
+}
+
 fn ready_buffer(api: &Api, subsystem: Handle, operation: &str) -> Result<Handle, Fault> {
     let mut buffer = ptr::null_mut();
     let code = unsafe { (api.olDaGetBuffer)(subsystem, &mut buffer) };
@@ -266,20 +286,13 @@ struct Stream {
 }
 impl Stream {
     fn stop(&mut self) -> Result<(), Fault> {
-        self.active.store(false, Ordering::Release);
-        let aborted = {
+        // GetBuffer is a nonblocking completion-queue poll. Join the reader
+        // before Abort moves unfinished buffers to that queue, otherwise a
+        // reader already waiting for the gate can report a false stop fault.
+        stop_stream_worker(&self.active, &mut self.worker, || {
             let _guard = self.gate.lock().unwrap();
-            check(
-                unsafe { (self.api.olDaAbort)(self.subsystem as Handle) },
-                "中止缓冲流",
-            )
-        };
-        if let Some(worker) = self.worker.take() {
-            worker
-                .join()
-                .map_err(|_| Fault::new("core_error", "原厂数据线程异常退出"))?;
-        }
-        aborted?; // Do not release driver-owned memory if DMA could still be active.
+            unsafe { (self.api.olDaAbort)(self.subsystem as Handle) }
+        })?; // Do not release driver-owned memory if DMA could still be active.
         let _guard = self.gate.lock().unwrap();
         check(
             unsafe { (self.api.olDaFlushBuffers)(self.subsystem as Handle) },
@@ -1019,6 +1032,37 @@ fn allocate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stream_stop_joins_reader_before_aborting_and_accepts_already_stopped() {
+        let active = Arc::new(AtomicBool::new(true));
+        let finished = Arc::new(AtomicBool::new(false));
+        let run = active.clone();
+        let done = finished.clone();
+        let mut worker = Some(thread::spawn(move || {
+            while run.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            done.store(true, Ordering::Release);
+        }));
+        stop_stream_worker(&active, &mut worker, || {
+            assert!(finished.load(Ordering::Acquire));
+            28
+        })
+        .unwrap();
+        assert!(worker.is_none());
+        assert!(!active.load(Ordering::Acquire));
+    }
+    #[test]
+    fn stream_stop_preserves_real_abort_and_buffer_errors() {
+        let active = AtomicBool::new(true);
+        let mut worker = None;
+        let fault = stop_stream_worker(&active, &mut worker, || 39).unwrap_err();
+        assert_eq!(fault.reason, "vendor_error");
+        assert!(fault.message.contains("0x00000027"));
+        // OLNOTRUNNING is not globally ignored on input/buffer operations.
+        assert!(check(28, "输入缓冲数据连续性").is_err());
+    }
+
     #[test]
     fn official_buffer_encoding_round_trips_with_gain_and_twos_complement() {
         for encoding in [200, 201] {

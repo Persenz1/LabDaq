@@ -135,7 +135,8 @@ impl Profile {
             || c.coupling.iter().any(|s| s != "AC" && s != "DC")
             || self.channels.iter().enumerate().any(|(i, ch)| {
                 ch.index != i
-                    || ch.sensitivity_mv_per_unit <= 0.0
+                    || ch.sensitivity_mv_per_unit < 0.0
+                    || (ch.unit != "V" && ch.sensitivity_mv_per_unit == 0.0)
                     || !ch.sensitivity_mv_per_unit.is_finite()
                     || !ch.zero_volts.is_finite()
                     || !ch.engineering_offset.is_finite()
@@ -1660,6 +1661,52 @@ mod tests {
 
     fn metadata(path: &PathBuf) -> Value {
         serde_json::from_slice(&fs::read(path.join("metadata.json")).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn channel_sensitivity_accepts_zero_only_for_voltage_profiles() {
+        let mut p = profile();
+        for channel in &mut p.channels {
+            channel.sensitivity_mv_per_unit = 0.0;
+        }
+        assert!(p.validate().is_ok());
+        for invalid in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            p.channels[0].sensitivity_mv_per_unit = invalid;
+            assert!(p.validate().is_err());
+        }
+        p.channels[0].sensitivity_mv_per_unit = 0.0;
+        p.channels[0].unit = "N".into();
+        assert!(p.validate().is_err());
+        p.channels[0].sensitivity_mv_per_unit = 10.0;
+        assert!(p.validate().is_ok());
+    }
+
+    #[test]
+    fn channel_sensitivity_validation_is_preserved_for_live_updates() {
+        let mut state = State::new();
+        let mut p = profile();
+        for channel in &mut p.channels {
+            channel.sensitivity_mv_per_unit = 0.0;
+        }
+        state
+            .command(Command::Start {
+                profile: Box::new(p),
+                recording_path: None,
+            })
+            .unwrap();
+        let mut channels = state.profile.as_ref().unwrap().channels.clone();
+        channels[0].unit = "N".into();
+        assert!(
+            state
+                .command(Command::SetChannels {
+                    channels: channels.clone(),
+                })
+                .is_err()
+        );
+        assert_eq!(state.profile.as_ref().unwrap().channels[0].unit, "V");
+        channels[0].sensitivity_mv_per_unit = 10.0;
+        state.command(Command::SetChannels { channels }).unwrap();
+        assert_eq!(state.profile.as_ref().unwrap().channels[0].unit, "N");
     }
 
     #[test]

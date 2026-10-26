@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "labdaq-prototype"
-version = "0.1.0"
-description = "Chinese desktop DAQ prototype with a source-grounded DT9837C protocol simulator"
+name = "labdaq"
+version = "1.0.0"
+description = "Chinese DT9837C data acquisition workbench"
 requires-python = ">=3.12"
 dependencies = [
     "numpy>=2.0", "scipy>=1.13", "PySide6>=6.8", "pyqtgraph>=0.14,<0.15",

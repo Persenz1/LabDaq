@@ -6,6 +6,8 @@ All acquisition and recording state is owned by the Rust executable.
 from __future__ import annotations
 
 from dataclasses import asdict
+from contextlib import contextmanager
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -27,10 +29,55 @@ if not FROZEN and not CORE_EXE.is_file():
     CORE_EXE = ROOT / "core" / "target" / "release" / _CORE_NAME
 
 
+@contextmanager
+def _startup_lock(endpoint):
+    """Serialize Windows GUI/API startup for the same endpoint."""
+    if os.name != "nt":
+        yield
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateMutexW.argtypes = (ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR)
+    kernel.CreateMutexW.restype = wintypes.HANDLE
+    kernel.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel.WaitForSingleObject.restype = wintypes.DWORD
+    kernel.ReleaseMutex.argtypes = (wintypes.HANDLE,)
+    kernel.ReleaseMutex.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel.CloseHandle.restype = wintypes.BOOL
+    key = hashlib.sha256(str(Path(endpoint).resolve()).casefold().encode("utf-8")).hexdigest()
+    handle = kernel.CreateMutexW(None, False, "Local\\LabDAQ-core-" + key)
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    acquired = False
+    try:
+        result = kernel.WaitForSingleObject(handle, 10000)
+        if result == 0x102:
+            raise TimeoutError("另一个界面或 API 正在启动核心，请稍后查询状态")
+        if result not in (0, 0x80):
+            raise ctypes.WinError(ctypes.get_last_error())
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            kernel.ReleaseMutex(handle)
+        kernel.CloseHandle(handle)
+
+
 class CoreClient:
     def __init__(self, endpoint=DEFAULT_ENDPOINT):
         self.endpoint = Path(endpoint)
         self.address = json.loads(self.endpoint.read_text(encoding="utf-8"))
+        if (not isinstance(self.address, dict)
+                or not isinstance(self.address.get("port"), int)
+                or not 0 < self.address["port"] <= 65535
+                or not isinstance(self.address.get("pid"), int)
+                or self.address["pid"] <= 0
+                or not isinstance(self.address.get("token"), str)
+                or not self.address["token"]):
+            raise ValueError("采集核心连接信息不完整")
 
     def request(self, op, **fields):
         with socket.create_connection(("127.0.0.1", self.address["port"]), timeout=3) as connection:
@@ -47,12 +94,24 @@ class CoreClient:
     def existing(cls, endpoint=DEFAULT_ENDPOINT):
         try:
             client = cls(endpoint)
-            return client, client.request("poll")
-        except (FileNotFoundError, ConnectionRefusedError):
+        except (FileNotFoundError, ValueError):
             return None
+        try:
+            return client, client.request("poll")
+        except (ConnectionRefusedError, ConnectionResetError, ConnectionAbortedError):
+            return None
+        except RuntimeError as exc:
+            if str(exc) == "请求格式或连接凭据无效":
+                return None
+            raise
 
     @classmethod
-    def connect_or_start(cls, endpoint=DEFAULT_ENDPOINT, port=47638):
+    def connect_or_start(cls, endpoint=DEFAULT_ENDPOINT, port=0):
+        with _startup_lock(endpoint):
+            return cls._connect_or_start(endpoint, port)
+
+    @classmethod
+    def _connect_or_start(cls, endpoint, port):
         existing = cls.existing(endpoint)
         if existing:
             return existing
@@ -69,7 +128,7 @@ class CoreClient:
         while time.monotonic() < deadline:
             try:
                 client = cls(endpoint)
-            except (FileNotFoundError, PermissionError):
+            except (FileNotFoundError, PermissionError, ValueError):
                 client = None
             # A restarted core can bind the same port before it replaces the
             # old endpoint file. Do not send the previous process's token.
@@ -78,6 +137,8 @@ class CoreClient:
             if process.poll() is not None:
                 raise RuntimeError(f"采集核心启动失败（退出码 {process.returncode}），检查端口 {port} 是否已占用")
             time.sleep(.025)
+        process.terminate()
+        process.wait(timeout=5)
         raise TimeoutError("采集核心未在 5 秒内就绪")
 
 
@@ -134,10 +195,15 @@ class RemoteEngine:
         with self._request_lock:
             state = self.client.request(op, **fields)
             with self._lock:
+                previous = self._state
                 self._state = state
                 self.connection_error = ""
                 if op == "poll":
                     width = len(state["profile"]["config"]["channels"])
+                    if (state["profile"]["config"] != previous["profile"]["config"]
+                            or state["acquisition_started_at_utc"] != previous["acquisition_started_at_utc"]):
+                        self._snapshot_end = None
+                        self._raw = np.empty((0, width))
                     incoming = np.asarray(state["raw"], dtype=np.float64).reshape(-1, width)
                     if state["snapshot_start"] == self._snapshot_end:
                         if len(incoming):

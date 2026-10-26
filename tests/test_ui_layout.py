@@ -118,7 +118,7 @@ def test_workbench_pages_and_command_bar_build_at_minimum_size(tmp_path):
             dialog.bulk_coupling.setCurrentText("AC")
             dialog.bulk_iepe.setCurrentText("开启")
             dialog.bulk_button.click()
-            assert dialog.cells[0][4].currentText() == "N"
+            assert dialog.cells[0][4].currentText() == "V"
             assert dialog.cells[0][9].currentText() == "±10 V"
             assert all(row[4].currentText() == "Pa" for row in dialog.cells[1:])
             assert all(row[9].currentText() == "±1 V" for row in dialog.cells[1:])
@@ -128,6 +128,8 @@ def test_workbench_pages_and_command_bar_build_at_minimum_size(tmp_path):
             dialog.cells[0][2].setValue(12)
             dialog.cells[0][3].setCurrentText("X-")
             dialog.cells[0][6].setValue(1.25)
+            for row in dialog.cells[1:]:
+                row[5].setValue(10)
             dialog.apply()
             assert window.channels[0].point_number == 12
             assert window.channels[0].direction == "X-"

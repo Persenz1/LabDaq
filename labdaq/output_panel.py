@@ -136,6 +136,8 @@ class OutputPanel(CollapsibleSection):
 
     def update_state(self, ready, state, unknown=False):
         running = state.get("running", False)
+        if running and state.get("settings"):
+            self.set_settings(state["settings"])
         self._can_start = ready and not running and not unknown
         active = running and not unknown
         if self.start_button.property("active") != active:
