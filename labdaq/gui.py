@@ -1089,8 +1089,8 @@ class MainWindow(W.QMainWindow):
         scan.setIcon(theme.icon("refresh", self.p.accent_text, 15))
         boot = button("冷启动离线验证", self.simulate_boot)
         boot.setIcon(theme.icon("play", self.p.text_muted, 15))
-        notes = button("打开技术说明", lambda: QtGui.QDesktopServices.openUrl(
-            QtCore.QUrl.fromLocalFile(str(ROOT / "docs" / "开发文档" / "technical-notes.md"))), "ghost")
+        notes = button("打开使用指南", lambda: QtGui.QDesktopServices.openUrl(
+            QtCore.QUrl.fromLocalFile(str(ROOT / "docs" / "用户手册" / "user-guide.md"))), "ghost")
         notes.setIcon(theme.icon("open", self.p.text_muted, 15))
         for widget in (scan, boot, notes):
             widget.setIconSize(QtCore.QSize(15, 15))

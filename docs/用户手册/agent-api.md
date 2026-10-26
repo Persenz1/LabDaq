@@ -1,326 +1,107 @@
-# LabDAQ 本机 Agent API 与自动化控制指南
+# LabDAQ 本机 Agent API
 
-[项目首页](../../README.md) / [文档中心](../README.md) / [用户手册](user-guide.md) / Agent API 指南
+Python 接口与 JSON 命令行复用界面使用的 Rust 核心，由核心独占 DT9837C 并调用原厂 Open Layers C API。安装包内置 Python 运行环境和原厂 OEM 安装程序，安装版命令行不需要配置开发环境、DLL 路径或另外安装原厂 Python/.NET SDK。Python 接口需能导入项目源码及其 Python 依赖，不需要 Qt 界面。
 
----
+## 安装版命令行
 
-LabDAQ 面向自动化测试台架、无人值守监测系统以及大模型（LLM）Agent 提供了两套轻量级、无图形界面的本机控制接口：
-1. **控制台命令行工具（CLI）**：`LabDAQ-api.exe`（安装版）或 `python -m labdaq.api`（源码环境）。
-2. **Python 编程接口（SDK）**：`labdaq.api.LabDAQ` 类。
+默认安装目录为 `%ProgramFiles%\LabDAQ`，包含 `LabDAQ.exe`（界面）和 `LabDAQ-api.exe`（控制台接口），共用内部运行环境。以下按默认安装位置举例，目录更改后使用实际路径。当前用户配置与运行状态位于 `%LOCALAPPDATA%\LabDAQ`，默认记录根目录为 Windows“文档”目录下的 `LabDAQ\recordings`；显式传入的记录路径按调用参数保存，不会重定向到默认根目录。
 
-接口复用与桌面 GUI 相同的 Rust 采集核心（`labdaq-core.exe`），实现跨进程独占 DT9837C 仪器与原厂 Open Layers 驱动交互。客户端进程退出**完全不会中断底层的连续采集、流盘写盘或模拟输出**。
-
----
-
-## 1. 架构原理与端点机制
-
-### 1.1 无状态客户端与独立核心
-
-LabDAQ 采用客户端-服务端（Client-Server）解耦设计：
-* **核心服务（Server）**：Rust 采集核心运行在后台，维护 200,000 帧环形缓冲区、直接执行 USB/驱动 Bulk I/O、负责 `raw.f64` 文件的无锁原子写入。
-* **Agent 客户端（Client）**：Python SDK 或 CLI 作为轻量客户端，通过 Localhost TCP 动态端口与核心交换换行定界的 JSON 数据包。
-* **端点发现（Endpoint Rendezvous）**：
-  * **安装版环境**：默认端点凭据文件位于 `%LOCALAPPDATA%\LabDAQ\.runtime\core.json`。
-  * **源码开发环境**：默认端点凭据文件位于 `<项目根目录>/.runtime/core.json`。
-  * `core.json` 包含动态 TCP 端口、随机通信 Token 与进程 PID。客户端在发起请求时自动解析凭据并完成认证。
-
-```text
-+------------------------------------+          +------------------------------------+
-|        LabDAQ-api.exe (CLI)        |          |      Python SDK (labdaq.api)       |
-+------------------------------------+          +------------------------------------+
-                  \                                               /
-                   \_______ 本地 TCP (127.0.0.1:<Port>) __________/
-                                (Token 鉴权, JSON 协议)
-                                           |
-                                           v
-                  +--------------------------------------------------+
-                  |             Rust 核心 (labdaq-core.exe)          |
-                  |  - 独占 Open Layers C-ABI 硬件会话               |
-                  |  - 实时环形缓冲区 (200,000 帧)                   |
-                  |  - 高速流盘写盘 (raw.f64 + metadata.json)        |
-                  |  - 独立 DAC 模拟输出波形供料线程                 |
-                  +--------------------------------------------------+
-```
-
----
-
-## 2. 命令行接口 (CLI Reference)
-
-### 2.1 调用形式与通用协议规范
-
-* **可执行程序路径**：
-  * **安装版**：`%ProgramFiles%\LabDAQ\LabDAQ-api.exe`
-  * **源码版**：`python -m labdaq.api`
-* **退出码（Exit Codes）**：
-  * `0`：命令成功执行。
-  * `1`：执行失败或参数校验错误。
-* **标准输出协议**：
-  * 命令行所有输出均采用标准的单行 UTF-8 编码 JSON 字符串，便于外部脚本可靠解析。
-  * **成功返回格式**：
-    ```json
-    {"ok": true, "result": { ... }}
-    ```
-  * **失败返回格式**：
-    ```json
-    {"ok": false, "error": "错误原因说明"}
-    ```
-
-### 2.2 CLI 命令速查表
-
-| 指令 | 参数说明 | 功能描述 |
-| :--- | :--- | :--- |
-| `status` | 无 | 查询系统运行状态（核心是否运行、采集/记录/AO状态等） |
-| `devices` | 无 | 枚举当前原厂驱动可见的物理数采硬件设备 |
-| `connect` | 无 | 连接数采并初始化为待机就绪状态（不开始采集） |
-| `start-acquisition` | `[--sample-rate RATE]`<br>`[--channels CH0 CH1 ...]` | 启动连续预览/采集，支持指定采样率与通道子集 |
-| `read` | `[--seconds SECONDS]` | 截取最近 $N$ 秒的时域电压快照数组（默认 1.0 秒） |
-| `start-recording` | `<PATH>`<br>`[--duration-seconds SEC]`<br>`[--experiment NAME]` | 在当前采集流上启动流式写盘，支持指定时长与实验名 |
-| `pause-recording` | 无 | 暂停流盘写盘（硬件采集与示波继续保持） |
-| `resume-recording`| 无 | 恢复流盘写盘，在元数据中追加新的记录分段 |
-| `stop-recording` | 无 | 结束当前实验流盘并完成元数据封顶，保持连续采集 |
-| `start-output` | `[--waveform {dc,sine,square,triangle}]`<br>`[--amplitude-v V]`<br>`[--offset-v V]`<br>`[--frequency-hz HZ]`<br>`[--sample-rate RATE]` | 启动 AO 模拟输出连续波形生成 |
-| `stop-output` | 无 | 停止 AO 模拟输出，硬件电平安全归零至 0.0V |
-| `stop-acquisition` | 无 | 停止连续采集，并收尾保存当前正在进行的记录组 |
-| `disconnect` | 无 | 停止采集与 AO 输出，释放原厂驱动会话 |
-| `export` | `<RECORDING_PATH>`<br>`<OUTPUT_PATH>`<br>`[--values {raw,engineering,both}]` | 将原生记录文件夹导出为 CSV 或 TXT 格式 |
-
-### 2.3 CLI 命令与返回示例
-
-#### 1. 查询系统状态 (`status`)
 ```powershell
-& "C:\Program Files\LabDAQ\LabDAQ-api.exe" status
+$daq = Join-Path $env:ProgramFiles 'LabDAQ\LabDAQ-api.exe'
+& $daq status
+& $daq devices
+& $daq connect
+& $daq start-acquisition --sample-rate 5000 --channels 0 1 2 3
+& $daq read --seconds 0.1
+& $daq start-recording 'D:\实验记录\测试-1' --duration-seconds 10 --experiment '接口测试'
+& $daq status
 ```
-* **核心未启动时的返回**：
-  ```json
-  {"ok": true, "result": {"core_running": false}}
-  ```
-* **核心运行时的典型返回**：
-  ```json
-  {
-    "ok": true,
-    "result": {
-      "core_running": true,
-      "pid": 12345,
-      "device_connected": true,
-      "running": true,
-      "recording": true,
-      "recording_paused": false,
-      "total_scans": 125000,
-      "recorded_scans": 125000,
-      "recording_target_scans": null,
-      "recording_remaining_scans": null,
-      "last_recording": "C:\\Users\\persenz\\Documents\\LabDAQ\\recordings\\拉伸试验\\工况-01",
-      "profile": {
-        "actual_rate": 5000.0,
-        "source": "vendor",
-        "config": {
-          "sample_rate": 5000.0,
-          "channels": [0, 1, 2, 3]
-        }
-      },
-      "output": {
-        "running": true,
-        "settings": {
-          "waveform": "sine",
-          "amplitude_v": 1.0,
-          "offset_v": 0.0,
-          "frequency_hz": 100.0,
-          "sample_rate": 48000.0
-        },
-        "actual_rate": 48000.0,
-        "zeroed": false,
-        "completed": false
-      }
-    }
-  }
-  ```
 
-#### 2. 枚举硬件设备 (`devices`)
+`start-recording` 立即返回，不等待记录完成。定长完成后 `status` 的 `recording` 为 false；还应检查 `termination_reason` 为 `duration_complete` 且 `error` 为空，确认正常完成。AI 仍继续预览。完整结束与导出：
+
 ```powershell
-& "C:\Program Files\LabDAQ\LabDAQ-api.exe" devices
+& $daq stop-acquisition
+& $daq export 'D:\实验记录\测试-1' 'D:\实验记录\测试-1.csv' --values both
 ```
-* **返回示例**：
-  ```json
-  {
-    "ok": true,
-    "result": [
-      {
-        "name": "DT9837C(00)",
-        "device_type": "DT9837C",
-        "driver_type": "open-layers-vendor"
-      }
-    ]
-  }
-  ```
 
-#### 3. 启动采集与时域读取 (`start-acquisition` / `read`)
+若是手动记录，先执行 `stop-recording`。使用 AO 时显式启动，结束后显式停止：
+
 ```powershell
-# 以 5000 S/s 启动通道 0 和 2
-& "C:\Program Files\LabDAQ\LabDAQ-api.exe" start-acquisition --sample-rate 5000 --channels 0 2
-
-# 截取最近 0.05 秒快照
-& "C:\Program Files\LabDAQ\LabDAQ-api.exe" read --seconds 0.05
-```
-* **`read` 命令返回格式**：
-  ```json
-  {
-    "ok": true,
-    "result": {
-      "sample_rate": 5000.0,
-      "start_scan": 150000,
-      "channel_indices": [0, 2],
-      "volts": [
-        [0.0123, -0.5432],
-        [0.0125, -0.5430],
-        ...
-      ]
-    }
-  }
-  ```
-  > [!NOTE] 关于 `read` 快照机制
-  > `read` 返回的是环形缓冲区内最近的有界时域采样数组，适用于 Agent 轮询监视与自适应状态判断。若需要无损完整的长时时域流，应通过 `start-recording` 进行原生流盘并调用 `export` 导出。
-
-#### 4. 流盘记录与暂停恢复 (`start-recording` / `pause-recording`)
-```powershell
-# 启动定长 10 秒记录
-& "C:\Program Files\LabDAQ\LabDAQ-api.exe" start-recording "D:\测试记录\01" --duration-seconds 10.0 --experiment "疲劳试验"
-
-# 暂停与恢复写盘
-& "C:\Program Files\LabDAQ\LabDAQ-api.exe" pause-recording
-& "C:\Program Files\LabDAQ\LabDAQ-api.exe" resume-recording
-
-# 结束写盘
-& "C:\Program Files\LabDAQ\LabDAQ-api.exe" stop-recording
+& $daq start-output --waveform sine --amplitude-v 0.2 --offset-v 0 --frequency-hz 10 --sample-rate 48000
+& $daq stop-output
+& $daq disconnect
 ```
 
-#### 5. 模拟信号输出 (`start-output` / `stop-output`)
-```powershell
-# 输出 48 kS/s、50 Hz、幅值 1.5 V、偏置 0.5 V 的正弦波
-& "C:\Program Files\LabDAQ\LabDAQ-api.exe" start-output --waveform sine --amplitude-v 1.5 --offset-v 0.5 --frequency-hz 50 --sample-rate 48000
+`--help` 查看全部参数。实际硬件操作需使用者安排好接线及 IEPE 设置；AO 与 AI 独立启停。不带参数的 `start-output` 使用 10 Hz 正弦、0.2 V 峰值、0 V 偏置、48 kS/s 更新率；波形支持 `dc`、`sine`、`square`、`triangle`，更新率支持 10000、20000、48000、96000 S/s。
 
-# 停止输出并硬件安全归零至 0.0V
-& "C:\Program Files\LabDAQ\LabDAQ-api.exe" stop-output
+## 命令与结果
+
+| 命令 | 行为 |
+| --- | --- |
+| `status` | 查询状态，核心未运行时返回 `core_running: false`，不启动核心或采集 |
+| `devices` | 列举原厂可见设备，需要时启动默认核心，不开始采集 |
+| `connect` | 连接后待机；已有连接或采集时返回现状 |
+| `start-acquisition` | 开始 AI，支持采样率及物理通道编号；已有采集时拒绝覆盖 |
+| `read --seconds N` | 返回最近 N 秒的有界原始电压快照 |
+| `start-recording PATH` | 在已有采集中建立原生记录组，已有目录不覆盖 |
+| `pause-recording` / `resume-recording` | 暂停/继续写盘，AI 继续，保留时间缺口 |
+| `stop-recording` | 结束当前组，继续预览 |
+| `stop-acquisition` | 停止 AI 并保存活动记录，AO 不变 |
+| `start-output` / `stop-output` | 启动 AO / 停止并下发 0 V |
+| `disconnect` | 停止采集及 AO 并释放设备会话 |
+| `export RECORDING OUTPUT` | 分块导出完整记录为 CSV/TXT，已有输出文件不覆盖 |
+
+帮助为普通文本；操作结果向 stdout 写一条 UTF-8 JSON。成功退出码为 0，失败为 1：
+
+```json
+{"ok": true, "result": {"core_running": false}}
 ```
 
-#### 6. 数据格式导出 (`export`)
-```powershell
-& "C:\Program Files\LabDAQ\LabDAQ-api.exe" export "D:\测试记录\01" "D:\测试记录\01.csv" --values both
+```json
+{"ok": false, "error": "采集核心未运行，请先连接设备或开始采集"}
 ```
 
----
+状态返回当前配置、是否采集/记录/暂停、扫描计数、记录路径、结束原因和 AO 状态，不返回连接令牌。`devices` 每项的字段为 `vendor_name`、`name`、`driver`、`model` 和 `backend`；其中 `backend` 为 `dt-open-layers-c-abi`，名称及型号来自原厂枚举结果。
 
-## 3. Python SDK 参考手册 (Python SDK Reference)
+`read` 返回 `sample_rate`、`start_scan`、`channel_indices` 和二维 `volts`（样本×通道）。时间按 `(start_scan + 行号) / sample_rate` 计算；通道号是 AI0–AI3 的 0–3，不是名称中的 1–4。窗口必须大于 0 且不超过 60 秒，另受每通道 200,000 帧核心缓存限制。它是显示快照，不能用多次调用拼成无损数据流；完整数据应通过原生记录和导出获取。
 
-`labdaq.api` 模块提供了纯 Python 开发的控制类 `LabDAQ`。该模块无 Qt 运行依赖，可直接在标准 Python 脚本、Jupyter Notebook 或自动化框架中导入。
+## Python SDK
 
-### 3.1 核心类初始化
+在源码项目目录和现有 Python 环境中：
 
 ```python
 from labdaq.api import LabDAQ
 
-# 1. 默认连接（自动识别安装版或源码版对应的端点）
 daq = LabDAQ()
-
-# 2. 显式指定端点连接
-from pathlib import Path
-daq = LabDAQ(endpoint=Path("C:/Users/persenz/AppData/Local/LabDAQ/.runtime/core.json"))
+print(daq.status())
+daq.connect()
+daq.start_acquisition(sample_rate=5000, channels=(0, 1, 2, 3))
+snapshot = daq.read(seconds=0.1)
+daq.start_recording(r'D:\实验记录\测试-2', duration_seconds=10, experiment='接口测试')
+# 稍后查询状态，确认定长记录正常完成，再停止采集和导出。
 ```
 
-### 3.2 完整自动化工作流范例
+SDK 方法与表中的命令对应，方法名用下划线，例如 `stop_acquisition()`、`stop_output()`。Python 额外可在 `start_acquisition` 传入四路的 `channel_settings`、`ranges`、`coupling` 和 `iepe`；`ranges`、`coupling` 和 `iepe` 均按 AI0–AI3 提供四项，不能只提供启用通道的值；`channel_settings` 使用四个 `ChannelSettings` 或完整通道字典。
 
-以下代码展示了从设备连接、参数配置、连续采集、AO 波形激励、流盘记录到数据导出的完整工程闭环：
+新会话默认通道1–4、V、灵敏度 0、±10 V、DC、IEPE 关闭。V 模式不使用灵敏度，显示和工程值仍应用零点、极性及工程偏移；原始电压记录不变。已有原厂会话未指定的配置会沿用当前值。Python 导出为 `daq.export(recording_path, output_path, values='both')`，也可选 `raw` 或 `engineering`。
+
+源码 SDK 默认使用源码 `.runtime/core.json`；安装版 CLI 默认使用 `%LOCALAPPDATA%\LabDAQ\.runtime\core.json`。普通 Python 中的 `LabDAQ()` 不会自动发现安装实例。从外部 Python 接回安装实例时，先用安装版 CLI 或 GUI 启动核心，再明确指定端点：
 
 ```python
-import time
+import os
+from pathlib import Path
 from labdaq.api import LabDAQ
 
-def main():
-    daq = LabDAQ()
-
-    # 1. 查询系统状态
-    print("1. 系统当前状态:", daq.status())
-
-    # 2. 枚举硬件设备并连接
-    devices = daq.devices()
-    print("2. 发现设备列表:", devices)
-    daq.connect()
-
-    # 3. 启动四通道 5000 S/s 数据采集
-    # 支持自定义每通道量程(10V/1V)、耦合(DC/AC)及 IEPE(True/False)
-    daq.start_acquisition(
-        sample_rate=5000.0,
-        channels=[0, 1, 2, 3],
-        ranges=[10.0, 10.0, 1.0, 10.0],
-        coupling=["DC", "DC", "AC", "DC"],
-        iepe=[False, False, True, False]
-    )
-    print("3. 数据采集已启动...")
-
-    # 4. 同步启动 AO 信号发生器：48 kS/s, 10 Hz, 1.0 V 正弦激励
-    daq.start_output(
-        waveform="sine",
-        amplitude_v=1.0,
-        offset_v=0.0,
-        frequency_hz=10.0,
-        sample_rate=48000.0
-    )
-    print("4. 模拟信号输出中...")
-
-    # 5. 实时截取 0.2 秒波形快照并打印
-    time.sleep(0.5)
-    snapshot = daq.read(seconds=0.2)
-    print(f"5. 快照信息: 采样率={snapshot['sample_rate']} Hz, 样本数={len(snapshot['volts'])}")
-
-    # 6. 启动定长 5 秒的数据流盘
-    recording_dir = "D:/experiment_data/run_001"
-    print("6. 启动数据流盘...")
-    daq.start_recording(recording_dir, duration_seconds=5.0, experiment="动力学特性测试")
-
-    # 7. 轮询等待流盘完成
-    while True:
-        status = daq.status()
-        if not status.get("recording", False):
-            print("7. 流盘已顺利完成，流盘写入帧数:", status.get("recorded_scans"), "累计采集帧数:", status.get("total_scans"))
-            break
-        time.sleep(0.5)
-
-    # 8. 停止模拟输出并安全归零
-    daq.stop_output()
-
-    # 9. 停止数据采集
-    daq.stop_acquisition()
-
-    # 10. 导出数据为 CSV（同时保留原始电压与工程量）
-    export_csv = "D:/experiment_data/run_001.csv"
-    daq.export(recording_dir, export_csv, values="both")
-    print("10. 数据已成功导出至:", export_csv)
-
-    # 11. 释放原厂驱动会话
-    daq.disconnect()
-    print("11. 设备会话已断开，流程结束。")
-
-if __name__ == "__main__":
-    main()
+daq = LabDAQ(Path(os.environ['LOCALAPPDATA']) / 'LabDAQ' / '.runtime' / 'core.json')
+print(daq.status())
 ```
 
----
+指定其他端点仅接回现有核心，不会在该位置启动开发核心。源码命令行入口为 `python -m labdaq.api`；显式端点参数放在子命令前，例如 `python -m labdaq.api --endpoint PATH status`。
 
-## 4. 与桌面 GUI 的协作机制
+## 与界面协作
 
-1. **会话共享与并发串行化**：
-   * 同一运行环境下的桌面 GUI 与 Agent API 共享唯一的后台 Rust 核心。
-   * 在 Windows 平台上，所有对核心发起的并发启动请求均由命名互斥锁（Named Mutex `Local\LabDAQ-core-<hash>`）串行化排队处理，避免端口抢占。
-2. **状态自动同步**：
-   * 当 Agent API 调用 `start-acquisition` 或更改通道配置后，已打开的桌面客户端通过核心事件轮询，界面上的波形图、通道卡片与读数自动无缝同步最新状态。
-   * 同样地，若在桌面 GUI 中点击“当前载荷归零”，元数据更新将立即作用于核心，后续由 Agent API 导出的工程量数据自动应用该零点偏置。
-3. **超时与异常重试规范**：
-   * 所有网络请求均具备严格的超时防护（默认 5 秒）。若发生网络超时，客户端抛出 `RuntimeError: 调用超时，执行结果未知`。
-   * **操作守则**：发生异常时，禁止盲目连续重发写命令；请先调用 `status()` 核验核心当前实际运行状态，再采取后续动作。
+同一运行模式和端点共用一个核心。Windows 命名互斥锁用于避免重复启动核心；控制命令由核心按接收顺序处理并检查状态。API 改变采集配置或记录组后，已打开的界面会更新实际状态。不同客户端控制的是同一设备，实验步骤应由一个控制端安排。
 
----
+Python 客户端没有退出时自动停止的逻辑，CLI 进程结束也不会停止采集、记录或 AO。控制调用超时会返回执行结果未知，不自动重发；先查询 `status` 再决定后续动作。接口只在本机使用，端点凭据由客户端内部读取。建立 TCP 连接的等待上限为 3 秒；连接和启动采集请求为 30 秒，其他请求为 5 秒。
 
-## 导航与相关文档
-
-- **操作手册**：[桌面客户端用户操作指南 (user-guide.md)](user-guide.md)
-- **底层协议参考**：[进程间通信与硬件控制规范](../技术规范/ipc-protocol-spec.md) · [数据流管线与存储技术规范](../技术规范/data-pipeline-and-storage.md)
-- **全局核心入口**：[项目首页](../../README.md) · [全局文档中心](../README.md)
+[返回用户指南](user-guide.md)

@@ -25,6 +25,7 @@ MinVersion=10.0.17763
 OutputDir={#OutputDir}
 OutputBaseFilename=LabDAQ-{#AppVersion}-windows-x64-setup
 UninstallDisplayIcon={app}\LabDAQ.exe
+SetupIconFile=LabDAQ.ico
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
